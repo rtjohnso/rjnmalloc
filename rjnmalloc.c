@@ -149,124 +149,132 @@ static void rjn_metadata_set(rjn_allocator *rjn, uint64_t unit, uint8_t value) {
   metadata[unit] = value;
 }
 
-static int rjn_metadata_cas_start_from_free_to_allocated(rjn_allocator *rjn,
-                                                         uint64_t unit,
-                                                         uint64_t size) {
-  return rjn_metadata_cas(rjn, unit, RJN_META_FREE,
-                          RJN_MIN_BINARY_SIZE <= size ? RJN_META_BINARY
-                                                      : RJN_META_UNARY);
-}
+// static int rjn_metadata_cas_start_from_free_to_allocated(rjn_allocator *rjn,
+//                                                          uint64_t first_unit,
+//                                                          uint64_t units) {
+//   return rjn_metadata_cas(rjn, first_unit, RJN_META_FREE,
+//                           units < RJN_MIN_BINARY_SIZE ? RJN_META_UNARY
+//                                                       : RJN_META_BINARY);
+// }
 
-static int rjn_metadata_cas_end_from_free_to_allocated(rjn_allocator *rjn,
-                                                       uint64_t unit,
-                                                       uint64_t size) {
-  return rjn_metadata_cas(rjn, unit + size - 1, RJN_META_FREE, RJN_META_UNARY);
-}
+// static int rjn_metadata_cas_end_from_free_to_allocated(rjn_allocator *rjn,
+//                                                        uint64_t first_unit,
+//                                                        uint64_t units) {
+//   return rjn_metadata_cas(rjn, first_unit + units - 1, RJN_META_FREE,
+//                           RJN_META_UNARY);
+// }
 
-static void rjn_metadata_casloop_end_from_free_to_allocated(rjn_allocator *rjn,
-                                                            uint64_t unit,
-                                                            uint64_t size) {
-  while (!rjn_metadata_cas_end_from_free_to_allocated(rjn, unit, size)) {
-    _mm_pause();
+// static void rjn_metadata_casloop_end_from_free_to_allocated(rjn_allocator
+// *rjn,
+//                                                             uint64_t
+//                                                             first_unit,
+//                                                             uint64_t units) {
+//   while (!rjn_metadata_cas_end_from_free_to_allocated(rjn, first_unit,
+//   units)) {
+//     _mm_pause();
+//   }
+// }
+
+// static void rjn_metadata_set_start_to_allocated(rjn_allocator *rjn,
+//                                                 uint64_t first_unit,
+//                                                 uint64_t units) {
+//   rjn_metadata_set(rjn, first_unit,
+//                    units < RJN_MIN_BINARY_SIZE ? RJN_META_UNARY
+//                                                : RJN_META_BINARY);
+// }
+
+// static void rjn_metadata_set_start_to_free(rjn_allocator *rjn,
+//                                            uint64_t first_unit,
+//                                            uint64_t units) {
+//   rjn_metadata_set(rjn, first_unit, RJN_META_FREE);
+// }
+
+// static void rjn_metadata_set_end_to_free(rjn_allocator *rjn,
+//                                          uint64_t first_unit, uint64_t units)
+//                                          {
+//   rjn_metadata_set(rjn, first_unit + units - 1, RJN_META_FREE);
+// }
+
+// static void rjn_metadata_set_end_to_allocated(rjn_allocator *rjn,
+//                                               uint64_t first_unit,
+//                                               uint64_t units) {
+//   rjn_metadata_set(rjn, first_unit + units - 1, RJN_META_CONTINUATION);
+// }
+
+static void rjn_metadata_set_size(rjn_allocator *rjn, uint64_t first_unit,
+                                  uint64_t units) {
+  for (uint64_t i = 1; i < units - 1; i++) {
+    rjn_metadata_set(rjn, first_unit + i, RJN_META_CONTINUATION);
   }
 }
 
-static void rjn_metadata_set_start_to_allocated(rjn_allocator *rjn,
-                                                uint64_t unit, uint64_t size) {
-  rjn_metadata_set(rjn, unit,
-                   RJN_MIN_BINARY_SIZE <= size ? RJN_META_BINARY
-                                               : RJN_META_UNARY);
-}
-
-static void rjn_metadata_set_start_to_free(rjn_allocator *rjn, uint64_t start,
-                                           uint64_t size) {
-  rjn_metadata_set(rjn, start, RJN_META_FREE);
-}
-
-static void rjn_metadata_set_end_to_free(rjn_allocator *rjn, uint64_t start,
-                                         uint64_t size) {
-  rjn_metadata_set(rjn, start + size - 1, RJN_META_FREE);
-}
-
-static void rjn_metadata_set_end_to_allocated(rjn_allocator *rjn,
-                                              uint64_t start, uint64_t size) {
-  if (1 < size) {
-    rjn_metadata_set(rjn, start + size - 1, RJN_META_CONTINUATION);
-  }
-}
-
-static void rjn_metadata_set_size(rjn_allocator *rjn, uint64_t start,
-                                  uint64_t size) {
-  for (uint64_t i = 1; i < size - 1; i++) {
-    rjn_metadata_set(rjn, start + i, RJN_META_CONTINUATION);
-  }
-}
-
-static uint64_t rjn_metadata_get_size(rjn_allocator *rjn, uint64_t start) {
+static uint64_t rjn_metadata_get_size(rjn_allocator *rjn, uint64_t first_unit) {
   uint64_t size = 1;
   uint8_t *metadata = rjn_metadata_vector(rjn);
-  while (metadata[start + size] == RJN_META_CONTINUATION) {
+  while (metadata[first_unit + size] == RJN_META_CONTINUATION) {
     size++;
   }
   return size;
 }
 
 static uint64_t rjn_grab_predecessor_if_free(rjn_allocator *rjn,
-                                             uint64_t start) {
-  if (start == 0) {
+                                             uint64_t my_start) {
+  if (my_start == 0) {
     return 0;
   }
-  uint64_t pred = start - 1;
-  if (!rjn_metadata_cas(rjn, pred, RJN_META_FREE, RJN_META_UNARY)) {
-    return start;
+  uint64_t pred_last = my_start - 1;
+  if (!rjn_metadata_cas(rjn, pred_last, RJN_META_FREE, RJN_META_UNARY)) {
+    return my_start;
   }
-  rjn_node *pred_node = rjn_allocation_unit(rjn, pred);
-  assert(pred_node->size <= start);
-  uint64_t pred_start = start - pred_node->size;
-  if (pred_start < pred &&
+  rjn_node *pred_node = rjn_allocation_unit(rjn, pred_last);
+  assert(pred_node->size <= my_start);
+  uint64_t pred_start = my_start - pred_node->size;
+  if (pred_start < pred_last &&
       !rjn_metadata_cas(rjn, pred_start, RJN_META_FREE, RJN_META_UNARY)) {
-    rjn_metadata_set(rjn, pred, RJN_META_FREE);
-    return start;
+    rjn_metadata_set(rjn, pred_last, RJN_META_FREE);
+    return my_start;
   }
   return pred_start;
 }
 
-static uint64_t rjn_grab_successor_if_free(rjn_allocator *rjn, uint64_t pred,
-                                           uint64_t size) {
-  if (rjn->num_allocation_units <= pred + size) {
+static uint64_t rjn_grab_successor_if_free(rjn_allocator *rjn,
+                                           uint64_t my_start,
+                                           uint64_t my_units) {
+  uint64_t succ_start = my_start + my_units;
+  if (rjn->num_allocation_units <= succ_start) {
     return 0;
   }
-  uint64_t succ = pred + size;
-  if (!rjn_metadata_cas(rjn, succ, RJN_META_FREE, RJN_META_UNARY)) {
+  if (!rjn_metadata_cas(rjn, succ_start, RJN_META_FREE, RJN_META_UNARY)) {
     return 0;
   }
-  rjn_node *succ_node = rjn_allocation_unit(rjn, succ);
-  uint64_t succ_end = succ + succ_node->size - 1;
-  if (succ < succ_end) {
-    while (!rjn_metadata_cas(rjn, succ_end, RJN_META_FREE, RJN_META_UNARY)) {
+  rjn_node *succ_node = rjn_allocation_unit(rjn, succ_start);
+  uint64_t succ_last = succ_start + succ_node->size - 1;
+  if (succ_start < succ_last) {
+    while (!rjn_metadata_cas(rjn, succ_last, RJN_META_FREE, RJN_META_UNARY)) {
       _mm_pause();
     }
   }
-  return succ;
+  return succ_start;
 }
 
-static void rjn_free_chunk(rjn_allocator *rjn, uint64_t start, uint64_t size) {
+static void rjn_free_chunk(rjn_allocator *rjn, uint64_t start_unit,
+                           uint64_t units) {
   rjn_node *start_node;
 restart:
-  start_node = rjn_allocation_unit(rjn, start);
-  rjn_node *end_node = rjn_allocation_unit(rjn, start + size - 1);
+  start_node = rjn_allocation_unit(rjn, start_unit);
+  rjn_node *last_node = rjn_allocation_unit(rjn, start_unit + units - 1);
 
-  start_node->size = size;
-  end_node->size = size;
+  start_node->size = units;
+  last_node->size = units;
 
-  size_class *sc = rjn_find_size_class(rjn, size);
+  size_class *sc = rjn_find_size_class(rjn, units);
   rjn_lock_size_class(sc);
   rjn_prepend(rjn, sc, start_node);
 
-  rjn_metadata_set_start_to_free(rjn, start, size);
+  rjn_metadata_set(rjn, start_unit, RJN_META_FREE);
 
-  uint64_t new_start = rjn_grab_predecessor_if_free(rjn, start);
-  if (new_start < start) {
+  uint64_t new_start = rjn_grab_predecessor_if_free(rjn, start_unit);
+  if (new_start < start_unit) {
     rjn_remove(rjn, start_node);
     rjn_unlock_size_class(sc);
     rjn_node *pred_start_node = rjn_allocation_unit(rjn, new_start);
@@ -274,23 +282,25 @@ restart:
     rjn_lock_size_class(pred_sc);
     rjn_remove(rjn, pred_start_node);
     rjn_unlock_size_class(pred_sc);
-    start = new_start;
-    size += pred_start_node->size;
+    start_unit = new_start;
+    units += pred_start_node->size;
     goto restart;
   }
 
-  rjn_metadata_set_end_to_free(rjn, start, size);
+  if (1 < units) {
+    rjn_metadata_set(rjn, start_unit + units - 1, RJN_META_FREE);
+  }
   rjn_unlock_size_class(sc);
 
-  uint64_t successor_start = rjn_grab_successor_if_free(rjn, start, size);
+  uint64_t successor_start = rjn_grab_successor_if_free(rjn, start_unit, units);
   if (successor_start) {
     rjn_node *succ_start_node = rjn_allocation_unit(rjn, successor_start);
     size_class *succ_sc = rjn_find_size_class(rjn, succ_start_node->size);
     rjn_lock_size_class(succ_sc);
     rjn_remove(rjn, succ_start_node);
     rjn_unlock_size_class(succ_sc);
-    start = successor_start;
-    size = succ_start_node->size;
+    start_unit = successor_start;
+    units = succ_start_node->size;
     goto restart;
   }
 }
@@ -303,8 +313,9 @@ static void *rjn_alloc_from_size_class(rjn_allocator *rjn, unsigned int scidx,
        curr_off = ((rjn_node *)rjn_pointer(rjn, curr_off))->next) {
     uint64_t first_unit =
         (curr_off - rjn->allocation_units_offset) / rjn->allocation_unit_size;
-    if (!rjn_metadata_cas_start_from_free_to_allocated(rjn, first_unit,
-                                                       units)) {
+    if (!rjn_metadata_cas(rjn, first_unit, RJN_META_FREE,
+                          units < RJN_MIN_BINARY_SIZE ? RJN_META_UNARY
+                                                      : RJN_META_BINARY)) {
       // If the CAS fails, that means that someone else is freeing the
       // previous chunk and merging their free chunk with the current one.
       continue;
@@ -319,31 +330,41 @@ static void *rjn_alloc_from_size_class(rjn_allocator *rjn, unsigned int scidx,
           (alignment_units - (first_unit % alignment_units)) % alignment_units;
     }
     if (node->size < pad_units + units) {
-      rjn_metadata_set_start_to_free(rjn, first_unit, units);
+      rjn_metadata_set(rjn, first_unit, RJN_META_FREE);
       continue;
     }
 
     // Allocate the chunk.
-    rjn_metadata_casloop_end_from_free_to_allocated(rjn, first_unit,
-                                                    node->size);
+    if (1 < node->size) {
+      while (!rjn_metadata_cas(rjn, first_unit + node->size - 1, RJN_META_FREE,
+                               RJN_META_CONTINUATION)) {
+        _mm_pause();
+      }
+    }
     rjn_remove(rjn, node);
     rjn_unlock_size_class(sc);
 
     // Give back any alignment pad at the beginning
     if (pad_units) {
-      rjn_metadata_set_end_to_allocated(rjn, first_unit, pad_units);
-      rjn_metadata_set_start_to_allocated(rjn, first_unit + pad_units, units);
+      if (1 < pad_units) {
+        rjn_metadata_set(rjn, first_unit + pad_units - 1,
+                         RJN_META_CONTINUATION);
+      }
+      rjn_metadata_set(rjn, first_unit + pad_units,
+                       units < RJN_MIN_BINARY_SIZE ? RJN_META_UNARY
+                                                   : RJN_META_BINARY);
       rjn_free_chunk(rjn, first_unit, pad_units);
     }
 
     // Give back any remaining space at the end
     if (pad_units + units < node->size) {
       if (1 < units) {
-        rjn_metadata_set_end_to_allocated(rjn, first_unit + pad_units, units);
+        rjn_metadata_set(rjn, first_unit + pad_units + units - 1,
+                         RJN_META_CONTINUATION);
       }
-      rjn_metadata_set_start_to_allocated(rjn, first_unit + pad_units + units,
-                                          node->size - pad_units - units);
-      rjn_free_chunk(rjn, first_unit + units, node->size - units);
+      rjn_metadata_set(rjn, first_unit + pad_units + units, RJN_META_UNARY);
+      rjn_free_chunk(rjn, first_unit + pad_units + units,
+                     node->size - pad_units - units);
     }
 
     rjn_metadata_set_size(rjn, first_unit + pad_units, units);
@@ -361,8 +382,8 @@ void *rjn_alloc(rjn_allocator *rjn, size_t alignment, size_t size) {
     size = 1;
   }
 
-  size_t units = (size + rjn->allocation_unit_size - 1) /
-                 rjn->allocation_unit_size; // round up
+  size_t units =
+      (size + rjn->allocation_unit_size - 1) / rjn->allocation_unit_size;
   size_t alignment_units = alignment / rjn->allocation_unit_size;
   uint64_t num_sclasses = rjn_num_size_classes(rjn);
 
@@ -386,7 +407,6 @@ void rjn_free(rjn_allocator *rjn, void *ptr) {
   uint64_t first_unit = (rjn_offset(rjn, ptr) - rjn->allocation_units_offset) /
                         rjn->allocation_unit_size;
   uint64_t size = rjn_metadata_get_size(rjn, first_unit);
-  //  memset(ptr, 0, size * rjn->allocation_unit_size);
   rjn_free_chunk(rjn, first_unit, size);
 }
 
