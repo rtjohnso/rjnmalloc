@@ -1,4 +1,5 @@
 #include "rjnmalloc.h"
+#define _XOPEN_SOURCE
 #include <assert.h>
 #include <inttypes.h>
 #include <math.h>
@@ -31,7 +32,7 @@ void malloc_test(rjn_allocator *hdr) {
   for (uint64_t i = 0; i < nrounds; i++) {
     int i = rand() % NALLOCATIONS;
     if (allocations[i].p) {
-      for (int j = 0; j < allocations[i].size; j++) {
+      for (unsigned int j = 0; j < allocations[i].size; j++) {
         assert(allocations[i].p[j] == allocations[i].c);
       }
       printf("freeing %p\n", allocations[i].p);
@@ -54,7 +55,7 @@ void malloc_test(rjn_allocator *hdr) {
 
   for (int i = 0; i < NALLOCATIONS; i++) {
     if (allocations[i].p) {
-      for (int j = 0; j < allocations[i].size; j++) {
+      for (unsigned int j = 0; j < allocations[i].size; j++) {
         assert(allocations[i].p[j] == allocations[i].c);
       }
       printf("freeing %p\n", allocations[i].p);
