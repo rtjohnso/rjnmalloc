@@ -40,10 +40,12 @@ typedef struct size_class {
 
 #define MIN_ALLOCATION_UNIT_SIZE (sizeof(rjn_node))
 
-uint64_t rjn_offset(rjn_allocator *rjn, void *ptr) { return ptr - (void *)rjn; }
+uint64_t rjn_offset(rjn_allocator *rjn, void *ptr) {
+  return (uint8_t *)ptr - (uint8_t *)rjn;
+}
 
 static void *rjn_pointer(rjn_allocator *rjn, uint64_t offset) {
-  return (void *)rjn + offset;
+  return (void *)((uint8_t *)rjn + offset);
 }
 
 static uint8_t *rjn_allocation_units(rjn_allocator *rjn) {
@@ -52,7 +54,7 @@ static uint8_t *rjn_allocation_units(rjn_allocator *rjn) {
 
 static rjn_node *rjn_allocation_unit(rjn_allocator *rjn, uint64_t i) {
   assert(i < rjn->num_allocation_units);
-  void *p = rjn_allocation_units(rjn);
+  uint8_t *p = rjn_allocation_units(rjn);
   return (rjn_node *)(p + i * rjn->allocation_unit_size);
 }
 
@@ -76,7 +78,7 @@ static unsigned int rjn_find_size_class_index(rjn_allocator *rjn,
                                               size_t units) {
   uint64_t num_sclasses = rjn_num_size_classes(rjn);
 
-  int fl = 63 - _lzcnt_u64(units);
+  unsigned int fl = 63 - _lzcnt_u64(units);
   if (num_sclasses <= fl) {
     return num_sclasses;
   } else {
@@ -163,7 +165,7 @@ static int rjn_metadata_cas_start_from_free_to_allocated(rjn_allocator *rjn,
 static int rjn_metadata_cas_end_from_free_to_allocated(rjn_allocator *rjn,
                                                        uint64_t unit,
                                                        uint64_t size) {
-  return rjn_metadata_cas(rjn, unit, RJN_META_FREE, RJN_META_UNARY);
+  return rjn_metadata_cas(rjn, unit + size - 1, RJN_META_FREE, RJN_META_UNARY);
 }
 
 static int rjn_metadata_cas_pred_from_free_to_allocated(rjn_allocator *rjn,
@@ -369,7 +371,7 @@ void *rjn_alloc(rjn_allocator *rjn, size_t alignment, size_t size) {
   size_t units = (size + rjn->allocation_unit_size - 1) /
                  rjn->allocation_unit_size; // round up
   size_t alignment_units = alignment / rjn->allocation_unit_size;
-  int num_sclasses = rjn_num_size_classes(rjn);
+  uint64_t num_sclasses = rjn_num_size_classes(rjn);
 
   // First search the larger size classes.  Any node in any of those size
   // classes should be sufficient to satisfy the request (except possibly due to

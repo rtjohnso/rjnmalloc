@@ -1,7 +1,7 @@
 CC = gcc
 LD = gcc
-CFLAGS = -g -Wall -Wextra -Werror -std=c99 -pedantic
-LDFLAGS = -lm
+CFLAGS = -g -Wall -Wextra -Werror -Wno-unused-parameter -std=c99 -pedantic -mlzcnt
+LDLIBS = -lm
 
 rjntest: rjntest.o rjnmalloc.o
 
