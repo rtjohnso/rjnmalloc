@@ -21,6 +21,7 @@ typedef struct allocation {
 typedef struct test_params {
   rjn_allocator *hdr;
   uint64_t nrounds;
+  int check_contents;
   allocation allocations[NALLOCATIONS];
 } test_params;
 
@@ -36,8 +37,10 @@ void malloc_test(test_params *params) {
   for (uint64_t i = 0; i < params->nrounds; i++) {
     int i = rand() % NALLOCATIONS;
     if (allocations[i].p) {
-      for (unsigned int j = 0; j < allocations[i].size; j++) {
-        assert(allocations[i].p[j] == allocations[i].c);
+      if (params->check_contents) {
+        for (unsigned int j = 0; j < allocations[i].size; j++) {
+          assert(allocations[i].p[j] == allocations[i].c);
+        }
       }
       rjn_free(hdr, allocations[i].p);
       allocations[i].p = NULL;
@@ -53,7 +56,9 @@ void malloc_test(test_params *params) {
         if (allocations[i].alignment) {
           assert(((uintptr_t)allocations[i].p) % allocations[i].alignment == 0);
         }
-        memset(allocations[i].p, allocations[i].c, allocations[i].size);
+        if (params->check_contents) {
+          memset(allocations[i].p, allocations[i].c, allocations[i].size);
+        }
       }
     }
   }
@@ -69,8 +74,10 @@ void cleanup_test(test_params *params) {
   allocation *allocations = params->allocations;
   for (int i = 0; i < NALLOCATIONS; i++) {
     if (allocations[i].p) {
-      for (unsigned int j = 0; j < allocations[i].size; j++) {
-        assert(allocations[i].p[j] == allocations[i].c);
+      if (params->check_contents) {
+        for (unsigned int j = 0; j < allocations[i].size; j++) {
+          assert(allocations[i].p[j] == allocations[i].c);
+        }
       }
       rjn_free(hdr, allocations[i].p);
       allocations[i].p = NULL;
@@ -81,18 +88,22 @@ void cleanup_test(test_params *params) {
 char rjnbuf[1 << 30];
 
 __attribute__((noreturn)) void usage(char *argv0) {
-  printf("Usage: %s [-n nrounds] [-t nthreads]\n", argv0);
+  printf("Usage: %s [-c] [-n nrounds] [-t nthreads]\n", argv0);
   exit(EXIT_FAILURE);
 }
 
 int main(int argc, char **argv) {
   int nrounds = 1000000;
   int nthreads = 4;
+  int check_contents = 0;
 
   int opt;
   char *endptr;
-  while ((opt = getopt(argc, argv, ":n:t:")) != -1) {
+  while ((opt = getopt(argc, argv, ":cn:t:")) != -1) {
     switch (opt) {
+    case 'c':
+      check_contents = 1;
+      break;
     case 'n':
       nrounds = strtoull(optarg, &endptr, 0);
       if (*endptr != '\0') {
@@ -125,6 +136,7 @@ int main(int argc, char **argv) {
   for (int i = 0; i < nthreads; i++) {
     params[i].hdr = hdr;
     params[i].nrounds = nrounds;
+    params[i].check_contents = check_contents;
   }
 
   printf("Running malloc_test with %d threads for %d rounds\n", nthreads,
