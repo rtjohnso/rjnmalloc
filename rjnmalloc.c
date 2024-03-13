@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <immintrin.h>
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 
 #define debug_assert(x) assert(x)
@@ -11,8 +12,6 @@ struct rjn_allocator {
   size_t region_size;
   size_t allocation_unit_size;
   uint64_t num_allocation_units;
-  int track_allocations;
-  uint64_t allocated_units;
 
   // Offset, in bytes, from start of this header, to the first allocation_unit.
   // The allocation units are located immediately after this header,
@@ -36,6 +35,8 @@ typedef struct rjn_node {
 
 typedef struct size_class {
   rjn_node head;
+  uint64_t num_chunks;
+  uint64_t num_units;
 } size_class;
 
 #define MIN_ALLOCATION_UNIT_SIZE (sizeof(rjn_node))
@@ -117,10 +118,11 @@ static void rjn_prepend(rjn_allocator *rjn, size_class *sclass,
     next->prev = rjn_offset(rjn, node);
   }
   sclass->head.next = rjn_offset(rjn, node);
-  __sync_fetch_and_sub(&rjn->allocated_units, node->size);
+  sclass->num_chunks++;
+  sclass->num_units += node->size;
 }
 
-static void rjn_remove(rjn_allocator *rjn, rjn_node *node) {
+static void rjn_remove(rjn_allocator *rjn, size_class *sclass, rjn_node *node) {
   rjn_node *prev = rjn_pointer(rjn, node->prev);
   debug_assert(prev->next == rjn_offset(rjn, node));
   prev->next = node->next;
@@ -129,7 +131,8 @@ static void rjn_remove(rjn_allocator *rjn, rjn_node *node) {
     debug_assert(next->prev == rjn_offset(rjn, node));
     next->prev = node->prev;
   }
-  __sync_fetch_and_add(&rjn->allocated_units, node->size);
+  sclass->num_chunks--;
+  sclass->num_units -= node->size;
 }
 
 #define RJN_META_FREE (0)
@@ -275,12 +278,12 @@ restart:
 
   uint64_t new_start = rjn_grab_predecessor_if_free(rjn, start_unit);
   if (new_start < start_unit) {
-    rjn_remove(rjn, start_node);
+    rjn_remove(rjn, sc, start_node);
     rjn_unlock_size_class(sc);
     rjn_node *pred_start_node = rjn_allocation_unit(rjn, new_start);
     size_class *pred_sc = rjn_find_size_class(rjn, pred_start_node->size);
     rjn_lock_size_class(pred_sc);
-    rjn_remove(rjn, pred_start_node);
+    rjn_remove(rjn, pred_sc, pred_start_node);
     rjn_unlock_size_class(pred_sc);
     start_unit = new_start;
     units += pred_start_node->size;
@@ -297,7 +300,7 @@ restart:
     rjn_node *succ_start_node = rjn_allocation_unit(rjn, successor_start);
     size_class *succ_sc = rjn_find_size_class(rjn, succ_start_node->size);
     rjn_lock_size_class(succ_sc);
-    rjn_remove(rjn, succ_start_node);
+    rjn_remove(rjn, succ_sc, succ_start_node);
     rjn_unlock_size_class(succ_sc);
     start_unit = successor_start;
     units = succ_start_node->size;
@@ -341,7 +344,7 @@ static void *rjn_alloc_from_size_class(rjn_allocator *rjn, unsigned int scidx,
         _mm_pause();
       }
     }
-    rjn_remove(rjn, node);
+    rjn_remove(rjn, sc, node);
     rjn_unlock_size_class(sc);
 
     // Give back any alignment pad at the beginning
@@ -411,7 +414,7 @@ void rjn_free(rjn_allocator *rjn, void *ptr) {
 }
 
 int rjn_init(rjn_allocator *rjn, size_t region_size,
-             size_t allocation_unit_size, int track_allocations) {
+             size_t allocation_unit_size) {
   if (region_size < sizeof(rjn_allocator)) {
     return -1;
   }
@@ -421,7 +424,6 @@ int rjn_init(rjn_allocator *rjn, size_t region_size,
 
   rjn->region_size = region_size;
   rjn->allocation_unit_size = allocation_unit_size;
-  rjn->track_allocations = track_allocations;
 
   rjn->allocation_units_offset = sizeof(rjn_allocator);
   uint64_t alignment =
@@ -462,8 +464,6 @@ int rjn_init(rjn_allocator *rjn, size_t region_size,
   last_node->size = rjn->num_allocation_units;
   rjn_prepend(rjn, &scs[num_scs - 1], first_node);
 
-  rjn->allocated_units = 0;
-
   return 0;
 }
 
@@ -485,7 +485,23 @@ void *rjn_end(rjn_allocator *rjn) {
                          rjn->num_allocation_units * rjn->allocation_unit_size);
 }
 
-size_t rjn_allocated(rjn_allocator *rjn) {
-  assert(rjn->track_allocations);
-  return rjn->allocated_units * rjn->allocation_unit_size;
+void rjn_print_allocation_stats(rjn_allocator *rjn) {
+  uint64_t num_sclasses = rjn_num_size_classes(rjn);
+  size_class *scs = rjn_size_classes(rjn);
+
+  uint64_t total_free_units = 0;
+  uint64_t total_free_chuynks = 0;
+  printf("----------------------------------------\n");
+  for (uint64_t i = 0; i < num_sclasses; i++) {
+    size_class *sc = &scs[i];
+    total_free_units += sc->num_units;
+    total_free_chuynks += sc->num_chunks;
+    printf("size class %2" PRIu64 ": %12" PRIu64 " chunks, %12" PRIu64
+           " units\n",
+           i, sc->num_chunks, sc->num_units);
+  }
+  printf("total free chunks: %" PRIu64 "\n", total_free_chuynks);
+  printf("total free units: %" PRIu64 "\n", total_free_units);
+  printf("total free bytes: %" PRIu64 "\n",
+         total_free_units * rjn->allocation_unit_size);
 }
