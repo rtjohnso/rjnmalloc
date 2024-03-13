@@ -139,8 +139,7 @@ static void rjn_remove(rjn_allocator *rjn, size_class *sclass, rjn_node *node) {
 #define RJN_META_UNARY (1)
 #define RJN_META_BINARY (2)
 #define RJN_META_CONTINUATION (3)
-#define RJN_MIN_BINARY_SIZE_CLASS (7)
-#define RJN_MIN_BINARY_UNITS (65)
+#define RJN_MIN_BINARY_UNITS (10)
 
 static int rjn_metadata_cas(rjn_allocator *rjn, uint64_t unit, uint8_t old,
                             uint8_t new) {
@@ -153,70 +152,30 @@ static void rjn_metadata_set(rjn_allocator *rjn, uint64_t unit, uint8_t value) {
   metadata[unit] = value;
 }
 
-// static int rjn_metadata_cas_start_from_free_to_allocated(rjn_allocator *rjn,
-//                                                          uint64_t first_unit,
-//                                                          uint64_t units) {
-//   return rjn_metadata_cas(rjn, first_unit, RJN_META_FREE,
-//                           units < RJN_MIN_BINARY_SIZE ? RJN_META_UNARY
-//                                                       : RJN_META_BINARY);
-// }
-
-// static int rjn_metadata_cas_end_from_free_to_allocated(rjn_allocator *rjn,
-//                                                        uint64_t first_unit,
-//                                                        uint64_t units) {
-//   return rjn_metadata_cas(rjn, first_unit + units - 1, RJN_META_FREE,
-//                           RJN_META_UNARY);
-// }
-
-// static void rjn_metadata_casloop_end_from_free_to_allocated(rjn_allocator
-// *rjn,
-//                                                             uint64_t
-//                                                             first_unit,
-//                                                             uint64_t units) {
-//   while (!rjn_metadata_cas_end_from_free_to_allocated(rjn, first_unit,
-//   units)) {
-//     _mm_pause();
-//   }
-// }
-
-// static void rjn_metadata_set_start_to_allocated(rjn_allocator *rjn,
-//                                                 uint64_t first_unit,
-//                                                 uint64_t units) {
-//   rjn_metadata_set(rjn, first_unit,
-//                    units < RJN_MIN_BINARY_SIZE ? RJN_META_UNARY
-//                                                : RJN_META_BINARY);
-// }
-
-// static void rjn_metadata_set_start_to_free(rjn_allocator *rjn,
-//                                            uint64_t first_unit,
-//                                            uint64_t units) {
-//   rjn_metadata_set(rjn, first_unit, RJN_META_FREE);
-// }
-
-// static void rjn_metadata_set_end_to_free(rjn_allocator *rjn,
-//                                          uint64_t first_unit, uint64_t units)
-//                                          {
-//   rjn_metadata_set(rjn, first_unit + units - 1, RJN_META_FREE);
-// }
-
-// static void rjn_metadata_set_end_to_allocated(rjn_allocator *rjn,
-//                                               uint64_t first_unit,
-//                                               uint64_t units) {
-//   rjn_metadata_set(rjn, first_unit + units - 1, RJN_META_CONTINUATION);
-// }
-
 static void rjn_metadata_set_size(rjn_allocator *rjn, uint64_t first_unit,
                                   uint64_t units) {
-  for (uint64_t i = 1; i < units - 1; i++) {
-    rjn_metadata_set(rjn, first_unit + i, RJN_META_CONTINUATION);
+
+  uint8_t *metadata = rjn_metadata_vector(rjn);
+  if (units < RJN_MIN_BINARY_UNITS) {
+    for (uint64_t i = 1; i < units - 1; i++) {
+      rjn_metadata_set(rjn, first_unit + i, RJN_META_CONTINUATION);
+    }
+  } else {
+    rjn_metadata_set(rjn, first_unit, RJN_META_BINARY);
+    memcpy(&metadata[first_unit + 1], &units, sizeof(uint64_t));
   }
 }
 
 static uint64_t rjn_metadata_get_size(rjn_allocator *rjn, uint64_t first_unit) {
-  uint64_t size = 1;
   uint8_t *metadata = rjn_metadata_vector(rjn);
-  while (metadata[first_unit + size] == RJN_META_CONTINUATION) {
-    size++;
+  uint64_t size;
+  if (metadata[first_unit] == RJN_META_UNARY) {
+    size = 1;
+    while (metadata[first_unit + size] == RJN_META_CONTINUATION) {
+      size++;
+    }
+  } else {
+    memcpy(&size, &metadata[first_unit + 1], sizeof(uint64_t));
   }
   return size;
 }
@@ -312,6 +271,9 @@ restart:
 static void *rjn_alloc_from_size_class(rjn_allocator *rjn, unsigned int scidx,
                                        size_t alignment_bytes, size_t bytes) {
   size_class *sc = &rjn_size_classes(rjn)[scidx];
+  if (!sc->num_chunks) {
+    return NULL;
+  }
   rjn_lock_size_class(sc);
 
   for (uint64_t curr_off = sc->head.next; curr_off;
@@ -319,10 +281,7 @@ static void *rjn_alloc_from_size_class(rjn_allocator *rjn, unsigned int scidx,
 
     uint64_t first_unit =
         (curr_off - rjn->allocation_units_offset) / rjn->allocation_unit_size;
-    if (!rjn_metadata_cas(rjn, first_unit, RJN_META_FREE,
-                          scidx < RJN_MIN_BINARY_SIZE_CLASS
-                              ? RJN_META_UNARY
-                              : RJN_META_BINARY)) {
+    if (!rjn_metadata_cas(rjn, first_unit, RJN_META_FREE, RJN_META_UNARY)) {
       // If the CAS fails, that means that someone else is freeing the
       // previous chunk and merging their free chunk with the current one.
       continue;
@@ -363,10 +322,7 @@ static void *rjn_alloc_from_size_class(rjn_allocator *rjn, unsigned int scidx,
         rjn_metadata_set(rjn, first_unit + pad_units - 1,
                          RJN_META_CONTINUATION);
       }
-      rjn_metadata_set(rjn, first_unit + pad_units,
-                       allocated_units < RJN_MIN_BINARY_UNITS
-                           ? RJN_META_UNARY
-                           : RJN_META_BINARY);
+      rjn_metadata_set(rjn, first_unit + pad_units, RJN_META_UNARY);
       rjn_free_chunk(rjn, first_unit, pad_units);
     }
 
