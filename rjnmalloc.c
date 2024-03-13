@@ -139,7 +139,8 @@ static void rjn_remove(rjn_allocator *rjn, size_class *sclass, rjn_node *node) {
 #define RJN_META_UNARY (1)
 #define RJN_META_BINARY (2)
 #define RJN_META_CONTINUATION (3)
-#define RJN_MIN_BINARY_SIZE (65)
+#define RJN_MIN_BINARY_SIZE_CLASS (7)
+#define RJN_MIN_BINARY_UNITS (65)
 
 static int rjn_metadata_cas(rjn_allocator *rjn, uint64_t unit, uint8_t old,
                             uint8_t new) {
@@ -309,16 +310,19 @@ restart:
 }
 
 static void *rjn_alloc_from_size_class(rjn_allocator *rjn, unsigned int scidx,
-                                       size_t alignment_units, size_t units) {
+                                       size_t alignment_bytes, size_t bytes) {
   size_class *sc = &rjn_size_classes(rjn)[scidx];
   rjn_lock_size_class(sc);
+
   for (uint64_t curr_off = sc->head.next; curr_off;
        curr_off = ((rjn_node *)rjn_pointer(rjn, curr_off))->next) {
+
     uint64_t first_unit =
         (curr_off - rjn->allocation_units_offset) / rjn->allocation_unit_size;
     if (!rjn_metadata_cas(rjn, first_unit, RJN_META_FREE,
-                          units < RJN_MIN_BINARY_SIZE ? RJN_META_UNARY
-                                                      : RJN_META_BINARY)) {
+                          scidx < RJN_MIN_BINARY_SIZE_CLASS
+                              ? RJN_META_UNARY
+                              : RJN_META_BINARY)) {
       // If the CAS fails, that means that someone else is freeing the
       // previous chunk and merging their free chunk with the current one.
       continue;
@@ -327,12 +331,18 @@ static void *rjn_alloc_from_size_class(rjn_allocator *rjn, unsigned int scidx,
 
     // Check if the current chunk is large enough to satisfy the request,
     // including alignment padding.
+    uint64_t pad_bytes = 0;
     uint64_t pad_units = 0;
-    if (alignment_units) {
-      pad_units =
-          (alignment_units - (first_unit % alignment_units)) % alignment_units;
+    if (1 < alignment_bytes) {
+      pad_bytes = alignment_bytes - ((uint64_t)node % alignment_bytes);
+      pad_units = pad_bytes / rjn->allocation_unit_size;
     }
-    if (node->size < pad_units + units) {
+    uint64_t required_bytes = pad_bytes + bytes;
+    uint64_t required_units = (required_bytes + rjn->allocation_unit_size - 1) /
+                              rjn->allocation_unit_size;
+    uint64_t allocated_units = required_units - pad_units;
+
+    if (node->size < required_units) {
       rjn_metadata_set(rjn, first_unit, RJN_META_FREE);
       continue;
     }
@@ -354,25 +364,27 @@ static void *rjn_alloc_from_size_class(rjn_allocator *rjn, unsigned int scidx,
                          RJN_META_CONTINUATION);
       }
       rjn_metadata_set(rjn, first_unit + pad_units,
-                       units < RJN_MIN_BINARY_SIZE ? RJN_META_UNARY
-                                                   : RJN_META_BINARY);
+                       allocated_units < RJN_MIN_BINARY_UNITS
+                           ? RJN_META_UNARY
+                           : RJN_META_BINARY);
       rjn_free_chunk(rjn, first_unit, pad_units);
     }
 
     // Give back any remaining space at the end
-    if (pad_units + units < node->size) {
-      if (1 < units) {
-        rjn_metadata_set(rjn, first_unit + pad_units + units - 1,
+    if (required_units < node->size) {
+      if (1 < allocated_units) {
+        rjn_metadata_set(rjn, first_unit + pad_units + allocated_units - 1,
                          RJN_META_CONTINUATION);
       }
-      rjn_metadata_set(rjn, first_unit + pad_units + units, RJN_META_UNARY);
-      rjn_free_chunk(rjn, first_unit + pad_units + units,
-                     node->size - pad_units - units);
+      rjn_metadata_set(rjn, first_unit + pad_units + allocated_units,
+                       RJN_META_UNARY);
+      rjn_free_chunk(rjn, first_unit + pad_units + allocated_units,
+                     node->size - pad_units - allocated_units);
     }
 
-    rjn_metadata_set_size(rjn, first_unit + pad_units, units);
+    rjn_metadata_set_size(rjn, first_unit + pad_units, allocated_units);
 
-    return node;
+    return (uint8_t *)node + pad_bytes;
   }
   rjn_unlock_size_class(sc);
   return NULL;
@@ -387,7 +399,6 @@ void *rjn_alloc(rjn_allocator *rjn, size_t alignment, size_t size) {
 
   size_t units =
       (size + rjn->allocation_unit_size - 1) / rjn->allocation_unit_size;
-  size_t alignment_units = alignment / rjn->allocation_unit_size;
   uint64_t num_sclasses = rjn_num_size_classes(rjn);
 
   // First search the larger size classes.  Any node in any of those size
@@ -395,7 +406,7 @@ void *rjn_alloc(rjn_allocator *rjn, size_t alignment, size_t size) {
   // alignment constraints).
   for (unsigned int scidx = 1 + rjn_find_size_class_index(rjn, units);
        scidx < num_sclasses; scidx++) {
-    void *ptr = rjn_alloc_from_size_class(rjn, scidx, alignment_units, units);
+    void *ptr = rjn_alloc_from_size_class(rjn, scidx, alignment, size);
     if (ptr) {
       return ptr;
     }
@@ -403,7 +414,7 @@ void *rjn_alloc(rjn_allocator *rjn, size_t alignment, size_t size) {
   // OK we're desperate.  Try groveling through the size class for this
   // particular size to see if there's anything there.
   return rjn_alloc_from_size_class(rjn, rjn_find_size_class_index(rjn, units),
-                                   alignment_units, units);
+                                   alignment, size);
 }
 
 void rjn_free(rjn_allocator *rjn, void *ptr) {

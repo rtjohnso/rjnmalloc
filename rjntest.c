@@ -11,6 +11,7 @@
 
 typedef struct allocation {
   uint8_t *p;
+  uint64_t alignment;
   size_t size;
   int c;
 } allocation;
@@ -42,11 +43,16 @@ void malloc_test(test_params *params) {
       allocations[i].p = NULL;
     } else {
       allocations[i].size = exp(lsize * drand48());
-      allocations[i].p = rjn_alloc(hdr, 0, allocations[i].size);
+      allocations[i].alignment = 0; // exp(lsize * drand48());
+      allocations[i].p =
+          rjn_alloc(hdr, allocations[i].alignment, allocations[i].size);
       allocations[i].c = rand() % 256;
       if (allocations[i].p) {
         assert(rstart <= allocations[i].p);
         assert(allocations[i].p + allocations[i].size <= rend);
+        if (allocations[i].alignment) {
+          assert(((uintptr_t)allocations[i].p) % allocations[i].alignment == 0);
+        }
         memset(allocations[i].p, allocations[i].c, allocations[i].size);
       }
     }
