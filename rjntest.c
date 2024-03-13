@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct allocation {
   uint8_t *p;
@@ -73,34 +74,62 @@ void cleanup_test(test_params *params) {
 
 char rjnbuf[1 << 30];
 
-#define NTHREADS (4)
+__attribute__((noreturn)) void usage(char *argv0) {
+  printf("Usage: %s [-n nrounds] [-t nthreads]\n", argv0);
+  exit(EXIT_FAILURE);
+}
 
 int main(int argc, char **argv) {
-  test_params params[NTHREADS];
-
   int nrounds = 1000000;
-  if (1 < argc) {
-    nrounds = strtoull(argv[1], NULL, 0);
+  int nthreads = 4;
+
+  int opt;
+  char *endptr;
+  while ((opt = getopt(argc, argv, ":n:t:")) != -1) {
+    switch (opt) {
+    case 'n':
+      nrounds = strtoull(optarg, &endptr, 0);
+      if (*endptr != '\0') {
+        printf("Invalid number of rounds: %s\n", optarg);
+        usage(argv[0]);
+      }
+      break;
+    case 't':
+      nthreads = strtoull(optarg, &endptr, 0);
+      if (*endptr != '\0') {
+        printf("Invalid number of threads: %s\n", optarg);
+        usage(argv[0]);
+      }
+      break;
+    case ':':
+      printf("Option -%c requires an operand\n", optopt);
+      usage(argv[0]);
+    default:
+      printf("Unknown option: -%c\n", optopt);
+      usage(argv[0]);
+    }
   }
+
+  test_params *params = (test_params *)malloc(sizeof(test_params) * nthreads);
 
   rjn_allocator *hdr = (rjn_allocator *)rjnbuf;
   int r = rjn_init(hdr, sizeof(rjnbuf), 1 << 6);
   assert(r == 0);
 
-  for (int i = 0; i < NTHREADS; i++) {
+  for (int i = 0; i < nthreads; i++) {
     params[i].hdr = hdr;
     params[i].nrounds = nrounds;
   }
 
-  printf("Running malloc_test with %d threads for %d rounds\n", NTHREADS,
+  printf("Running malloc_test with %d threads for %d rounds\n", nthreads,
          nrounds);
 
-  pthread_t threads[4];
-  for (int i = 0; i < NTHREADS; i++) {
+  pthread_t *threads = (pthread_t *)malloc(sizeof(pthread_t) * nthreads);
+  for (int i = 0; i < nthreads; i++) {
     pthread_create(&threads[i], NULL, malloc_test_thread, &params[i]);
   }
 
-  for (int i = 0; i < NTHREADS; i++) {
+  for (int i = 0; i < nthreads; i++) {
     pthread_join(threads[i], NULL);
   }
 
@@ -110,7 +139,7 @@ int main(int argc, char **argv) {
 
   printf("Cleaning up\n");
 
-  for (int i = 0; i < NTHREADS; i++) {
+  for (int i = 0; i < nthreads; i++) {
     cleanup_test(&params[i]);
   }
 
