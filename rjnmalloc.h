@@ -11,6 +11,7 @@ void *rjn_alloc(rjn_allocator *rjn, size_t alignment, size_t size);
 void rjn_free(rjn_allocator *rjn, void *ptr);
 
 size_t rjn_size(rjn_allocator *rjn);
+size_t rjn_allocation_unit_size(rjn_allocator *rjn);
 void *rjn_start(rjn_allocator *rjn);
 void *rjn_end(rjn_allocator *rjn);
 void rjn_print_allocation_stats(rjn_allocator *rjn);

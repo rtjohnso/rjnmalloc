@@ -21,6 +21,8 @@ typedef struct allocation {
 typedef struct test_params {
   rjn_allocator *hdr;
   uint64_t nrounds;
+  uint64_t successful_allocations;
+  uint64_t failed_allocations;
   int check_contents;
   allocation allocations[NALLOCATIONS];
 } test_params;
@@ -33,13 +35,14 @@ void malloc_test(test_params *params) {
   double lsize = log(rjn_size(hdr));
   uint8_t *rstart = (uint8_t *)rjn_start(hdr);
   uint8_t *rend = (uint8_t *)rjn_end(hdr);
+  size_t au_size = rjn_allocation_unit_size(hdr);
 
-  for (uint64_t i = 0; i < params->nrounds; i++) {
+  for (uint64_t j = 0; j < params->nrounds; j++) {
     int i = rand() % NALLOCATIONS;
     if (allocations[i].p) {
       if (params->check_contents) {
-        for (unsigned int j = 0; j < allocations[i].size; j++) {
-          assert(allocations[i].p[j] == allocations[i].c);
+        for (unsigned int k = 0; k < allocations[i].size; k++) {
+          assert(allocations[i].p[k] == allocations[i].c);
         }
       }
       rjn_free(hdr, allocations[i].p);
@@ -51,6 +54,7 @@ void malloc_test(test_params *params) {
           rjn_alloc(hdr, allocations[i].alignment, allocations[i].size);
       allocations[i].c = rand() % 256;
       if (allocations[i].p) {
+        params->successful_allocations++;
         assert(rstart <= allocations[i].p);
         assert(allocations[i].p + allocations[i].size <= rend);
         if (allocations[i].alignment) {
@@ -58,7 +62,11 @@ void malloc_test(test_params *params) {
         }
         if (params->check_contents) {
           memset(allocations[i].p, allocations[i].c, allocations[i].size);
+        } else {
+          memset(allocations[i].p, allocations[i].c, au_size);
         }
+      } else {
+        params->failed_allocations++;
       }
     }
   }
@@ -136,6 +144,8 @@ int main(int argc, char **argv) {
   for (int i = 0; i < nthreads; i++) {
     params[i].hdr = hdr;
     params[i].nrounds = nrounds;
+    params[i].successful_allocations = 0;
+    params[i].failed_allocations = 0;
     params[i].check_contents = check_contents;
   }
 
@@ -154,6 +164,16 @@ int main(int argc, char **argv) {
   printf("Allocation stats after test:\n");
 
   rjn_print_allocation_stats(hdr);
+
+  uint64_t total_successful_allocations = 0;
+  uint64_t total_failed_allocations = 0;
+  for (int i = 0; i < nthreads; i++) {
+    total_successful_allocations += params[i].successful_allocations;
+    total_failed_allocations += params[i].failed_allocations;
+  }
+  printf("Total successful allocations: %" PRIu64 "\n",
+         total_successful_allocations);
+  printf("Total failed allocations: %" PRIu64 "\n", total_failed_allocations);
 
   printf("Cleaning up\n");
 
