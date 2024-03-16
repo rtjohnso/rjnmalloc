@@ -54,6 +54,8 @@ typedef struct size_class {
 #define RJN_META_FREE (3)
 #define RJN_MIN_BINARY_UNITS (10)
 
+static const char *metaname[] = {"C", "U", "B", "F"};
+
 /*
  * Elementary operations
  */
@@ -85,8 +87,6 @@ static uint8_t *rjn_metadata_vector(rjn_allocator *rjn) {
 /*
  * Debug printing code
  */
-static const char *metaname[] = {"F", "U", "B", "C"};
-
 debug_code static void node_to_string(rjn_allocator *rjn, rjn_node *node,
                                       char *buffer, size_t buffer_size) {
   uint64_t offset = rjn_offset(rjn, node);
@@ -253,6 +253,104 @@ static void rjn_metadata_set(rjn_allocator *rjn, uint64_t unit, uint8_t value) {
                metadata[unit] < 4 ? metaname[metadata[unit]] : "size?",
                metaname[value]);
   metadata[unit] = value;
+}
+
+/* This performs the following logical operation atomically:
+ * if unit == rjn->num_allocation_units - 1 or
+      metadata[uniit + 1] == RJN_META_UNARY or
+      metadata[unit + 1] == RJN_META_BINARY
+ * then
+     set metadata[unit] to RJN_META_FREE
+     return 1
+ * else
+     return 0
+ */
+
+static int rjn_metadata_try_set_end_to_free(rjn_allocator *rjn, uint64_t unit) {
+  if (unit == rjn->num_allocation_units - 1) {
+    rjn_metadata_set(rjn, unit, RJN_META_FREE);
+    return 1;
+  }
+
+  uint8_t *metadata = rjn_metadata_vector(rjn);
+  uint16_t *p = (uint16_t *)&metadata[unit];
+  uint8_t oldmeta[2] = {metadata[unit], metadata[unit + 1]};
+  assert(oldmeta[0] != RJN_META_FREE);
+  assert(oldmeta[1] != RJN_META_CONTINUATION);
+  if (oldmeta[1] == RJN_META_FREE) {
+    return 0;
+  }
+  uint8_t newmeta[2] = {RJN_META_FREE, oldmeta[1]};
+  return __sync_bool_compare_and_swap(p, *(uint16_t *)oldmeta,
+                                      *(uint16_t *)newmeta);
+}
+
+/* This performs the following logical operation atomically
+ * if unit == 0 or
+      metadata[uniit - 1] != RJN_META_FREE
+ * then
+     set metadata[unit] to RJN_META_FREE
+     return 1
+ * else
+     return 0
+ */
+static int rjn_metadata_try_set_start_to_free(rjn_allocator *rjn,
+                                              uint64_t unit) {
+  if (unit == 0) {
+    rjn_metadata_set(rjn, unit, RJN_META_FREE);
+    return 1;
+  }
+
+  uint8_t *metadata = rjn_metadata_vector(rjn);
+  uint16_t *p = (uint16_t *)&metadata[unit - 1];
+  uint8_t oldmeta[2] = {metadata[unit - 1], metadata[unit]};
+  assert(oldmeta[1] != RJN_META_FREE);
+  if (oldmeta[0] == RJN_META_FREE) {
+    return 0;
+  }
+  uint8_t newmeta[2] = {oldmeta[0], RJN_META_FREE};
+  return __sync_bool_compare_and_swap(p, *(uint16_t *)oldmeta,
+                                      *(uint16_t *)newmeta);
+}
+
+/* This performs the following logical operation atomically
+ * if (unit == 0 or
+      metadata[uniit - 1] == RJN_META_UNARY or
+      metadata[unit - 1] == RJN_META_BINARY)
+      and
+      (unit == rjn->num_allocation_units - 1 or
+      metadata[uniit + 1] == RJN_META_UNARY or
+      metadata[unit + 1] == RJN_META_BINARY)
+ * then
+     set metadata[unit] to RJN_META_FREE
+     return 1
+ * else
+     return 0
+ */
+static int rjn_metadata_try_set_singleton_to_free(rjn_allocator *rjn,
+                                                  uint64_t unit) {
+  if (unit == 0 && unit == rjn->num_allocation_units - 1) {
+    rjn_metadata_set(rjn, unit, RJN_META_FREE);
+    return 1;
+  } else if (unit == 0) {
+    return rjn_metadata_try_set_end_to_free(rjn, unit);
+  } else if (unit == rjn->num_allocation_units - 1) {
+    return rjn_metadata_try_set_start_to_free(rjn, unit);
+  } else {
+  }
+
+  uint8_t *metadata = rjn_metadata_vector(rjn);
+  uint32_t *p = (uint32_t *)&metadata[unit - 1];
+  uint8_t oldmeta[4] = {metadata[unit - 1], metadata[unit], metadata[unit + 1],
+                        metadata[unit + 2]};
+  assert(oldmeta[1] != RJN_META_FREE);
+  assert(oldmeta[2] != RJN_META_CONTINUATION);
+  if (oldmeta[0] == RJN_META_FREE || oldmeta[2] == RJN_META_FREE) {
+    return 0;
+  }
+  uint8_t newmeta[4] = {oldmeta[0], RJN_META_FREE, oldmeta[2], oldmeta[3]};
+  return __sync_bool_compare_and_swap(p, *(uint32_t *)oldmeta,
+                                      *(uint32_t *)newmeta);
 }
 
 static void rjn_metadata_set_size(rjn_allocator *rjn, uint64_t first_unit,
@@ -482,6 +580,9 @@ static void rjn_free_chunk(rjn_allocator *rjn, uint64_t start_unit,
                            uint64_t units) {
   rjn_node *start_node;
   uint8_t *metadata = rjn_metadata_vector(rjn);
+
+restart:
+
   assert(metadata[start_unit] == RJN_META_UNARY ||
          metadata[start_unit] == RJN_META_BINARY);
   if (1 < units) {
@@ -489,31 +590,6 @@ static void rjn_free_chunk(rjn_allocator *rjn, uint64_t start_unit,
   }
 
   rjn_metadata_erase_size(rjn, start_unit, units);
-
-  // Try to merge with our predecessor.
-  uint64_t new_start = rjn_grab_predecessor_if_free(rjn, start_unit);
-  if (new_start < start_unit) {
-    rjn_node *pred_start_node = rjn_allocation_unit(rjn, new_start);
-    size_class *pred_sc = rjn_find_size_class(rjn, pred_start_node->size);
-    rjn_lock_size_class(pred_sc);
-    rjn_remove(rjn, pred_sc, pred_start_node);
-    rjn_unlock_size_class(pred_sc);
-    rjn_metadata_set(rjn, start_unit, RJN_META_CONTINUATION);
-    start_unit = new_start;
-    units += pred_start_node->size;
-  }
-
-  // Try to merge with our successor.
-  uint64_t successor_start = rjn_grab_successor_if_free(rjn, start_unit, units);
-  if (successor_start) {
-    rjn_node *succ_start_node = rjn_allocation_unit(rjn, successor_start);
-    size_class *succ_sc = rjn_find_size_class(rjn, succ_start_node->size);
-    rjn_lock_size_class(succ_sc);
-    rjn_remove(rjn, succ_sc, succ_start_node);
-    rjn_unlock_size_class(succ_sc);
-    rjn_metadata_set(rjn, successor_start, RJN_META_CONTINUATION);
-    units += succ_start_node->size;
-  }
 
   start_node = rjn_allocation_unit(rjn, start_unit);
   rjn_node *last_node = rjn_allocation_unit(rjn, start_unit + units - 1);
@@ -526,9 +602,92 @@ static void rjn_free_chunk(rjn_allocator *rjn, uint64_t start_unit,
   rjn_prepend(rjn, sc, start_node);
   rjn_unlock_size_class(sc);
 
-  rjn_metadata_set(rjn, start_unit, RJN_META_FREE);
-  if (1 < units) {
-    rjn_metadata_set(rjn, start_unit + units - 1, RJN_META_FREE);
+  if (units == 1) {
+
+    if (!rjn_metadata_try_set_singleton_to_free(rjn, start_unit)) {
+      rjn_lock_size_class(sc);
+      rjn_remove(rjn, sc, start_node);
+      rjn_unlock_size_class(sc);
+
+      // Try to merge with our predecessor.
+      uint64_t new_start = rjn_grab_predecessor_if_free(rjn, start_unit);
+      if (new_start < start_unit) {
+        rjn_node *pred_start_node = rjn_allocation_unit(rjn, new_start);
+        size_class *pred_sc = rjn_find_size_class(rjn, pred_start_node->size);
+        rjn_lock_size_class(pred_sc);
+        rjn_remove(rjn, pred_sc, pred_start_node);
+        rjn_unlock_size_class(pred_sc);
+        rjn_metadata_set(rjn, start_unit, RJN_META_CONTINUATION);
+        start_unit = new_start;
+        units += pred_start_node->size;
+      }
+
+      // Try to merge with our successor.
+      uint64_t successor_start =
+          rjn_grab_successor_if_free(rjn, start_unit, units);
+      if (successor_start) {
+        rjn_node *succ_start_node = rjn_allocation_unit(rjn, successor_start);
+        size_class *succ_sc = rjn_find_size_class(rjn, succ_start_node->size);
+        rjn_lock_size_class(succ_sc);
+        rjn_remove(rjn, succ_sc, succ_start_node);
+        rjn_unlock_size_class(succ_sc);
+        rjn_metadata_set(rjn, successor_start, RJN_META_CONTINUATION);
+        units += succ_start_node->size;
+      }
+
+      goto restart;
+    }
+
+  } else {
+
+    if (!rjn_metadata_try_set_start_to_free(rjn, start_unit)) {
+      rjn_lock_size_class(sc);
+      rjn_remove(rjn, sc, start_node);
+      rjn_unlock_size_class(sc);
+
+      // Try to merge with our predecessor.
+      uint64_t new_start = rjn_grab_predecessor_if_free(rjn, start_unit);
+      if (new_start < start_unit) {
+        rjn_node *pred_start_node = rjn_allocation_unit(rjn, new_start);
+        size_class *pred_sc = rjn_find_size_class(rjn, pred_start_node->size);
+        rjn_lock_size_class(pred_sc);
+        rjn_remove(rjn, pred_sc, pred_start_node);
+        rjn_unlock_size_class(pred_sc);
+        rjn_metadata_set(rjn, start_unit, RJN_META_CONTINUATION);
+        start_unit = new_start;
+        units += pred_start_node->size;
+      }
+
+      goto restart;
+    }
+
+    if (!rjn_metadata_try_set_end_to_free(rjn, start_unit + units - 1)) {
+      if (!rjn_metadata_cas(rjn, start_unit, RJN_META_FREE, RJN_META_UNARY)) {
+        // Someone else is already trying to allocate this chunk or to merge
+        // with this chunk from the left, so we can finish freeing the chunk and
+        // return.
+        rjn_metadata_set(rjn, start_unit + units - 1, RJN_META_FREE);
+      } else {
+        rjn_lock_size_class(sc);
+        rjn_remove(rjn, sc, start_node);
+        rjn_unlock_size_class(sc);
+
+        // Try to merge with our successor.
+        uint64_t successor_start =
+            rjn_grab_successor_if_free(rjn, start_unit, units);
+        if (successor_start) {
+          rjn_node *succ_start_node = rjn_allocation_unit(rjn, successor_start);
+          size_class *succ_sc = rjn_find_size_class(rjn, succ_start_node->size);
+          rjn_lock_size_class(succ_sc);
+          rjn_remove(rjn, succ_sc, succ_start_node);
+          rjn_unlock_size_class(succ_sc);
+          rjn_metadata_set(rjn, successor_start, RJN_META_CONTINUATION);
+          units += succ_start_node->size;
+        }
+
+        goto restart;
+      }
+    }
   }
 }
 
