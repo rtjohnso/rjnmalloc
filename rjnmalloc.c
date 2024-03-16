@@ -74,10 +74,9 @@ static uint8_t *rjn_metadata_vector(rjn_allocator *rjn) {
 }
 
 #define RJN_META_CONTINUATION (0)
-#define RJN_META_FREE (3)
 #define RJN_META_UNARY (1)
 #define RJN_META_BINARY (2)
-#define RJN_META_FREEING (4)
+#define RJN_META_FREE (3)
 #define RJN_MIN_BINARY_UNITS (10)
 
 static const char *metaname[] = {"F", "U", "B", "C"};
@@ -443,10 +442,6 @@ static uint64_t rjn_grab_successor_if_free(rjn_allocator *rjn,
   if (rjn->num_allocation_units <= succ_start) {
     return 0;
   }
-  uint8_t *metadata = rjn_metadata_vector(rjn);
-  while (metadata[succ_start] == RJN_META_FREEING) {
-    _mm_pause();
-  }
   if (!rjn_metadata_cas(rjn, succ_start, RJN_META_FREE, RJN_META_UNARY)) {
     return 0;
   }
@@ -488,7 +483,6 @@ static void rjn_free_chunk(rjn_allocator *rjn, uint64_t start_unit,
                            uint64_t units) {
   rjn_node *start_node;
   uint8_t *metadata = rjn_metadata_vector(rjn);
-restart:
   assert(metadata[start_unit] == RJN_META_UNARY ||
          metadata[start_unit] == RJN_META_BINARY);
   if (1 < units) {
@@ -497,22 +491,29 @@ restart:
 
   rjn_metadata_erase_size(rjn, start_unit, units);
 
-  // Make our free operation visible to a thread which might be in the process
-  // of freeing our predecessor.
-  rjn_metadata_set(rjn, start_unit, RJN_META_FREEING);
-
   // Try to merge with our predecessor.
   uint64_t new_start = rjn_grab_predecessor_if_free(rjn, start_unit);
   if (new_start < start_unit) {
-    rjn_metadata_set(rjn, start_unit, RJN_META_CONTINUATION);
     rjn_node *pred_start_node = rjn_allocation_unit(rjn, new_start);
     size_class *pred_sc = rjn_find_size_class(rjn, pred_start_node->size);
     rjn_lock_size_class(pred_sc);
     rjn_remove(rjn, pred_sc, pred_start_node);
     rjn_unlock_size_class(pred_sc);
+    rjn_metadata_set(rjn, start_unit, RJN_META_CONTINUATION);
     start_unit = new_start;
     units += pred_start_node->size;
-    goto restart;
+  }
+
+  // Try to merge with our successor.
+  uint64_t successor_start = rjn_grab_successor_if_free(rjn, start_unit, units);
+  if (successor_start) {
+    rjn_node *succ_start_node = rjn_allocation_unit(rjn, successor_start);
+    size_class *succ_sc = rjn_find_size_class(rjn, succ_start_node->size);
+    rjn_lock_size_class(succ_sc);
+    rjn_remove(rjn, succ_sc, succ_start_node);
+    rjn_unlock_size_class(succ_sc);
+    rjn_metadata_set(rjn, successor_start, RJN_META_CONTINUATION);
+    units += succ_start_node->size;
   }
 
   start_node = rjn_allocation_unit(rjn, start_unit);
@@ -529,22 +530,6 @@ restart:
   rjn_metadata_set(rjn, start_unit, RJN_META_FREE);
   if (1 < units) {
     rjn_metadata_set(rjn, start_unit + units - 1, RJN_META_FREE);
-  }
-
-  // We have freed our chunk and possibly merged with our predecessor.
-  // Now, if our successor is free, we allocate and free it, which will merge it
-  // with our chunk (unless our chunk gets allocated in the meantime).
-
-  uint64_t successor_start = rjn_grab_successor_if_free(rjn, start_unit, units);
-  if (successor_start) {
-    rjn_node *succ_start_node = rjn_allocation_unit(rjn, successor_start);
-    size_class *succ_sc = rjn_find_size_class(rjn, succ_start_node->size);
-    rjn_lock_size_class(succ_sc);
-    rjn_remove(rjn, succ_sc, succ_start_node);
-    rjn_unlock_size_class(succ_sc);
-    start_unit = successor_start;
-    units = succ_start_node->size;
-    goto restart;
   }
 }
 
