@@ -309,6 +309,18 @@ static void rjn_walk_chunks(rjn_allocator *rjn, chunk_walk_func func,
       break;
     }
     assert(size);
+    for (uint64_t i =
+             metadata[curr_unit] == RJN_META_BINARY ? 1 + sizeof(uint64_t) : 1;
+         i < size - 1; i++) {
+      assert(metadata[curr_unit + i] == RJN_META_CONTINUATION);
+    }
+    if (1 < size) {
+      if (metadata[curr_unit] == RJN_META_FREE) {
+        assert(metadata[curr_unit + size - 1] == RJN_META_FREE);
+      } else {
+        assert(metadata[curr_unit + size - 1] == RJN_META_CONTINUATION);
+      }
+    }
     func(rjn, curr_unit, size, arg);
     curr_unit += size;
     assert(curr_unit <= rjn->num_allocation_units);
@@ -414,10 +426,12 @@ static uint64_t rjn_grab_predecessor_if_free(rjn_allocator *rjn,
   rjn_node *pred_node = rjn_allocation_unit(rjn, pred_last);
   assert(pred_node->size <= my_start);
   uint64_t pred_start = my_start - pred_node->size;
-  if (pred_start < pred_last &&
-      !rjn_metadata_cas(rjn, pred_start, RJN_META_FREE, RJN_META_UNARY)) {
-    rjn_metadata_set(rjn, pred_last, RJN_META_FREE);
-    return my_start;
+  if (pred_start < pred_last) {
+    if (!rjn_metadata_cas(rjn, pred_start, RJN_META_FREE, RJN_META_UNARY)) {
+      rjn_metadata_set(rjn, pred_last, RJN_META_FREE);
+      return my_start;
+    }
+    rjn_metadata_set(rjn, pred_last, RJN_META_CONTINUATION);
   }
   return pred_start;
 }
@@ -483,24 +497,13 @@ restart:
 
   rjn_metadata_erase_size(rjn, start_unit, units);
 
-  start_node = rjn_allocation_unit(rjn, start_unit);
-  rjn_node *last_node = rjn_allocation_unit(rjn, start_unit + units - 1);
-
-  start_node->size = units;
-  last_node->size = units;
-
-  size_class *sc = rjn_find_size_class(rjn, units);
-  rjn_lock_size_class(sc);
-  rjn_prepend(rjn, sc, start_node);
-  rjn_unlock_size_class(sc);
-
+  // Make our free operation visible to a thread which might be in the process
+  // of freeing our predecessor.
   rjn_metadata_set(rjn, start_unit, RJN_META_FREEING);
 
+  // Try to merge with our predecessor.
   uint64_t new_start = rjn_grab_predecessor_if_free(rjn, start_unit);
   if (new_start < start_unit) {
-    rjn_lock_size_class(sc);
-    rjn_remove(rjn, sc, start_node);
-    rjn_unlock_size_class(sc);
     rjn_metadata_set(rjn, start_unit, RJN_META_CONTINUATION);
     rjn_node *pred_start_node = rjn_allocation_unit(rjn, new_start);
     size_class *pred_sc = rjn_find_size_class(rjn, pred_start_node->size);
@@ -511,6 +514,17 @@ restart:
     units += pred_start_node->size;
     goto restart;
   }
+
+  start_node = rjn_allocation_unit(rjn, start_unit);
+  rjn_node *last_node = rjn_allocation_unit(rjn, start_unit + units - 1);
+
+  start_node->size = units;
+  last_node->size = units;
+
+  size_class *sc = rjn_find_size_class(rjn, units);
+  rjn_lock_size_class(sc);
+  rjn_prepend(rjn, sc, start_node);
+  rjn_unlock_size_class(sc);
 
   rjn_metadata_set(rjn, start_unit, RJN_META_FREE);
   if (1 < units) {
