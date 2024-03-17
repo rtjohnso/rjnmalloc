@@ -149,16 +149,20 @@ int main(int argc, char **argv) {
     params[i].check_contents = check_contents;
   }
 
-  printf("Running malloc_test with %d threads for %d rounds\n", nthreads,
-         nrounds);
+  printf("Running malloc_test with %d thread%s for %d round%s\n", nthreads,
+         nthreads == 1 ? "" : "s", nrounds, nrounds == 1 ? "" : "s");
 
-  pthread_t *threads = (pthread_t *)malloc(sizeof(pthread_t) * nthreads);
-  for (int i = 0; i < nthreads; i++) {
-    pthread_create(&threads[i], NULL, malloc_test_thread, &params[i]);
-  }
+  if (1 < nthreads) {
+    pthread_t *threads = (pthread_t *)malloc(sizeof(pthread_t) * nthreads);
+    for (int i = 0; i < nthreads; i++) {
+      pthread_create(&threads[i], NULL, malloc_test_thread, &params[i]);
+    }
 
-  for (int i = 0; i < nthreads; i++) {
-    pthread_join(threads[i], NULL);
+    for (int i = 0; i < nthreads; i++) {
+      pthread_join(threads[i], NULL);
+    }
+  } else {
+    malloc_test(&params[0]);
   }
 
   printf("Allocation stats after test:\n");
