@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define RJN_DEBUG 1
+#define RJN_DEBUG 0
 #define RJN_DUMP_CHUNKS 1
 #define debug_code __attribute__((unused))
 #if RJN_DEBUG
@@ -351,7 +351,8 @@ static void rjn_metadata_erase_size(rjn_allocator *rjn, uint64_t first_unit,
       rjn_metadata_set(rjn, first_unit + i, RJN_META_CONTINUATION);
     }
     while (i + META_ENTRIES_PER_BYTE <= units - 1) {
-      metadata[first_unit + i] = META_CONTINUATION_BYTE;
+      metadata[(first_unit + i) / META_ENTRIES_PER_BYTE] =
+          META_CONTINUATION_BYTE;
       i += META_ENTRIES_PER_BYTE;
     }
     while (i < units - 1) {
