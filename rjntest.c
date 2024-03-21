@@ -27,6 +27,8 @@ typedef struct test_params {
   allocation allocations[NALLOCATIONS];
 } test_params;
 
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
 void malloc_test(test_params *params) {
   rjn_allocator *hdr = params->hdr;
   allocation *allocations = params->allocations;
@@ -49,7 +51,7 @@ void malloc_test(test_params *params) {
       allocations[i].p = NULL;
     } else {
       allocations[i].size = exp(lsize * drand48());
-      allocations[i].alignment = 0; // exp(lsize * drand48());
+      allocations[i].alignment = exp(lsize * drand48());
       allocations[i].p =
           rjn_alloc(hdr, allocations[i].alignment, allocations[i].size);
       allocations[i].c = rand() % 256;
@@ -63,7 +65,8 @@ void malloc_test(test_params *params) {
         if (params->check_contents) {
           memset(allocations[i].p, allocations[i].c, allocations[i].size);
         } else {
-          memset(allocations[i].p, allocations[i].c, au_size);
+          memset(allocations[i].p, allocations[i].c,
+                 MIN(allocations[i].size, au_size));
         }
       } else {
         params->failed_allocations++;
