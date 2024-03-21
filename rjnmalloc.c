@@ -5,7 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define RJN_DEBUG 0
+#define RJN_DEBUG 1
+#define RJN_DUMP_CHUNKS 1
 #define debug_code __attribute__((unused))
 #if RJN_DEBUG
 #define debug_printf(...) printf(__VA_ARGS__)
@@ -50,7 +51,10 @@ typedef struct size_class {
 #define RJN_META_UNARY (1)
 #define RJN_META_BINARY (2)
 #define RJN_META_FREE (3)
-#define RJN_MIN_BINARY_UNITS (2 + sizeof(uint64_t))
+#define BITS_PER_META_ENTRY (2)
+#define RJN_MIN_BINARY_UNITS                                                   \
+  (2 + (8 - BITS_PER_META_ENTRY) / BITS_PER_META_ENTRY +                       \
+   8 * sizeof(uint64_t) / BITS_PER_META_ENTRY)
 
 static const char *metaname[] = {"C", "U", "B", "F"};
 
@@ -82,6 +86,19 @@ static rjn_node *rjn_allocation_unit(rjn_allocator *rjn, uint64_t i) {
  * Metadata operations
  */
 
+#define META_ENTRIES_PER_BYTE (8 / BITS_PER_META_ENTRY)
+#define META_ENTRY_MASK ((1 << BITS_PER_META_ENTRY) - 1)
+#define VECTOR_INDEX(i) ((i) / META_ENTRIES_PER_BYTE)
+#define VECTOR_BYTE(v, i) ((v)[VECTOR_INDEX(i)])
+#define BYTE_EXTRACT(b, i)                                                     \
+  (((b) >> (BITS_PER_META_ENTRY * ((i) % META_ENTRIES_PER_BYTE))) &            \
+   META_ENTRY_MASK)
+#define META_GET(m, u) BYTE_EXTRACT(VECTOR_BYTE(m, u), u)
+#define BYTE_INSERT(b, i)                                                      \
+  (((b)&META_ENTRY_MASK) << (BITS_PER_META_ENTRY *                             \
+                             ((i) % META_ENTRIES_PER_BYTE)))
+#define META_CONTINUATION_BYTE (RJN_META_CONTINUATION * 0xcc)
+
 static uint8_t *rjn_metadata_vector(rjn_allocator *rjn) {
   return (uint8_t *)rjn_pointer(rjn, rjn->metadata_offset);
 }
@@ -89,26 +106,40 @@ static uint8_t *rjn_metadata_vector(rjn_allocator *rjn) {
 static uint8_t rjn_metadata_get(rjn_allocator *rjn, uint64_t unit) {
   assert(unit < rjn->num_allocation_units);
   uint8_t *metadata = rjn_metadata_vector(rjn);
-  return metadata[unit];
+  return META_GET(metadata, unit);
 }
 
 static int rjn_metadata_cas(rjn_allocator *rjn, uint64_t unit, uint8_t old,
                             uint8_t new) {
   assert(unit < rjn->num_allocation_units);
   uint8_t *metadata = rjn_metadata_vector(rjn);
-  int r = __sync_bool_compare_and_swap(&metadata[unit], old, new);
-  debug_printf("metadata_cas %lu %s %s %d\n", unit, metaname[old],
-               metaname[new], r);
-  return r;
+  uint8_t mask = BYTE_INSERT(old ^ new, unit);
+  uint8_t oldbyte;
+  do {
+    oldbyte = VECTOR_BYTE(metadata, unit);
+    if (BYTE_EXTRACT(oldbyte, unit) != old) {
+      return 0;
+    }
+  } while (!__sync_bool_compare_and_swap(&VECTOR_BYTE(metadata, unit), oldbyte,
+                                         oldbyte ^ mask));
+  return 1;
 }
 
 static void rjn_metadata_set(rjn_allocator *rjn, uint64_t unit, uint8_t value) {
   assert(unit < rjn->num_allocation_units);
   uint8_t *metadata = rjn_metadata_vector(rjn);
   debug_printf("metadata_set %lu %s %s\n", unit,
-               metadata[unit] < 4 ? metaname[metadata[unit]] : "size?",
+               META_GET(metadata, unit) < 4 ? metaname[META_GET(metadata, unit)]
+                                            : "size?",
                metaname[value]);
-  metadata[unit] = value;
+
+  uint8_t oldbyte;
+  uint8_t newbyte;
+  do {
+    oldbyte = VECTOR_BYTE(metadata, unit);
+    newbyte = oldbyte ^ BYTE_INSERT(value ^ BYTE_EXTRACT(oldbyte, unit), unit);
+  } while (!__sync_bool_compare_and_swap(&VECTOR_BYTE(metadata, unit), oldbyte,
+                                         newbyte));
 }
 
 /* This performs the following logical operation atomically:
@@ -121,7 +152,6 @@ static void rjn_metadata_set(rjn_allocator *rjn, uint64_t unit, uint8_t value) {
  * else
      return 0
  */
-
 static int rjn_metadata_try_set_end_to_free(rjn_allocator *rjn, uint64_t unit) {
   assert(unit < rjn->num_allocation_units);
   if (unit == rjn->num_allocation_units - 1) {
@@ -130,16 +160,28 @@ static int rjn_metadata_try_set_end_to_free(rjn_allocator *rjn, uint64_t unit) {
   }
 
   uint8_t *metadata = rjn_metadata_vector(rjn);
-  uint16_t *p = (uint16_t *)&metadata[unit];
-  uint8_t oldmeta[2] = {metadata[unit], metadata[unit + 1]};
-  assert(oldmeta[0] != RJN_META_FREE);
-  assert(oldmeta[1] != RJN_META_CONTINUATION);
-  if (oldmeta[1] == RJN_META_FREE) {
+  uint64_t moff = VECTOR_INDEX(unit);
+  uint8_t oldmeta[2] = {metadata[moff], metadata[moff + 1]};
+  uint8_t *oldmetap = &oldmeta[0] - moff;
+  uint8_t oldme = META_GET(oldmetap, unit);
+  uint8_t oldsucc = META_GET(oldmetap, unit + 1);
+  assert(oldme != RJN_META_FREE);
+  assert(oldsucc != RJN_META_CONTINUATION);
+  if (oldsucc == RJN_META_FREE) {
     return 0;
   }
-  uint8_t newmeta[2] = {RJN_META_FREE, oldmeta[1]};
-  return __sync_bool_compare_and_swap(p, *(uint16_t *)oldmeta,
-                                      *(uint16_t *)newmeta);
+  uint8_t newmeta[2] = {oldmeta[0] ^ BYTE_INSERT(oldme ^ RJN_META_FREE, unit),
+                        oldmeta[1]};
+  if (VECTOR_INDEX(unit + 1) == VECTOR_INDEX(unit)) {
+    // Do a 1-byte CAS, which reduces the probability of performing a
+    // cross-cache-line CAS, which are hella slow.
+    return __sync_bool_compare_and_swap(&metadata[moff], oldmeta[0],
+                                        newmeta[0]);
+  } else {
+    uint16_t *p = (uint16_t *)&metadata[moff];
+    return __sync_bool_compare_and_swap(p, *(uint16_t *)oldmeta,
+                                        *(uint16_t *)newmeta);
+  }
 }
 
 /* This performs the following logical operation atomically
@@ -160,15 +202,28 @@ static int rjn_metadata_try_set_start_to_free(rjn_allocator *rjn,
   }
 
   uint8_t *metadata = rjn_metadata_vector(rjn);
-  uint16_t *p = (uint16_t *)&metadata[unit - 1];
-  uint8_t oldmeta[2] = {metadata[unit - 1], metadata[unit]};
-  assert(oldmeta[1] != RJN_META_FREE);
-  if (oldmeta[0] == RJN_META_FREE) {
+  uint64_t moff = VECTOR_INDEX(unit - 1);
+  uint8_t oldmeta[2] = {metadata[moff], metadata[moff + 1]};
+  uint8_t *oldmetap = &oldmeta[0] - moff;
+  uint8_t oldpred = META_GET(oldmetap, unit - 1);
+  uint8_t oldme = META_GET(oldmetap, unit);
+  assert(oldme != RJN_META_FREE);
+  if (oldpred == RJN_META_FREE) {
     return 0;
   }
-  uint8_t newmeta[2] = {oldmeta[0], RJN_META_FREE};
-  return __sync_bool_compare_and_swap(p, *(uint16_t *)oldmeta,
-                                      *(uint16_t *)newmeta);
+  uint8_t newmeta[2] = {oldmeta[0], oldmeta[1]};
+  uint8_t *newmetap = &newmeta[0] - moff;
+  newmetap[VECTOR_INDEX(unit)] ^= BYTE_INSERT(oldme ^ RJN_META_FREE, unit);
+  if (VECTOR_INDEX(unit) == moff) {
+    // Do a 1-byte CAS, which reduces the probability of performing a
+    // cross-cache-line CAS, which are hella slow.
+    return __sync_bool_compare_and_swap(&metadata[moff], oldmeta[0],
+                                        newmeta[0]);
+  } else {
+    uint16_t *p = (uint16_t *)&metadata[moff];
+    return __sync_bool_compare_and_swap(p, *(uint16_t *)oldmeta,
+                                        *(uint16_t *)newmeta);
+  }
 }
 
 /* This performs the following logical operation atomically
@@ -199,17 +254,30 @@ static int rjn_metadata_try_set_singleton_to_free(rjn_allocator *rjn,
   }
 
   uint8_t *metadata = rjn_metadata_vector(rjn);
-  uint32_t *p = (uint32_t *)&metadata[unit - 1];
-  uint8_t oldmeta[4] = {metadata[unit - 1], metadata[unit], metadata[unit + 1],
-                        metadata[unit + 2]};
-  assert(oldmeta[1] != RJN_META_FREE);
-  assert(oldmeta[2] != RJN_META_CONTINUATION);
-  if (oldmeta[0] == RJN_META_FREE || oldmeta[2] == RJN_META_FREE) {
+  uint64_t moff = VECTOR_INDEX(unit - 1);
+  uint8_t oldmeta[2] = {metadata[moff], metadata[moff + 1]};
+  uint8_t *oldmetap = &oldmeta[0] - moff;
+  uint8_t oldpred = META_GET(oldmetap, unit - 1);
+  uint8_t oldme = META_GET(oldmetap, unit);
+  uint8_t oldsucc = META_GET(oldmetap, unit + 1);
+  assert(oldme != RJN_META_FREE);
+  assert(oldsucc != RJN_META_CONTINUATION);
+  if (oldpred == RJN_META_FREE || oldsucc == RJN_META_FREE) {
     return 0;
   }
-  uint8_t newmeta[4] = {oldmeta[0], RJN_META_FREE, oldmeta[2], oldmeta[3]};
-  return __sync_bool_compare_and_swap(p, *(uint32_t *)oldmeta,
-                                      *(uint32_t *)newmeta);
+  uint8_t newmeta[2] = {oldmeta[0], oldmeta[1]};
+  uint8_t *newmetap = &newmeta[0] - moff;
+  newmetap[VECTOR_INDEX(unit)] ^= BYTE_INSERT(oldme ^ RJN_META_FREE, unit);
+  if (VECTOR_INDEX(unit + 1) == VECTOR_INDEX(unit - 1)) {
+    // Do a 1-byte CAS, which reduces the probability of performing a
+    // cross-cache-line CAS, which are hella slow.
+    return __sync_bool_compare_and_swap(&metadata[moff], oldmeta[0],
+                                        newmeta[0]);
+  } else {
+    uint16_t *p = (uint16_t *)&metadata[moff];
+    return __sync_bool_compare_and_swap(p, *(uint16_t *)oldmeta,
+                                        *(uint16_t *)newmeta);
+  }
 }
 
 static void rjn_metadata_set_size(rjn_allocator *rjn, uint64_t first_unit,
@@ -217,16 +285,26 @@ static void rjn_metadata_set_size(rjn_allocator *rjn, uint64_t first_unit,
   assert(first_unit + units <= rjn->num_allocation_units);
   uint8_t *metadata = rjn_metadata_vector(rjn);
   if (units < RJN_MIN_BINARY_UNITS) {
-    assert(metadata[first_unit] == RJN_META_UNARY);
+    assert(META_GET(metadata, first_unit) == RJN_META_UNARY);
     assert(first_unit + units <= rjn->num_allocation_units);
-    for (uint64_t i = 1; i < units - 1; i++) {
+    uint64_t i;
+    for (i = 1; i < units - 1 && (first_unit + i) % META_ENTRIES_PER_BYTE;
+         i++) {
+      rjn_metadata_set(rjn, first_unit + i, RJN_META_CONTINUATION);
+    }
+    memset(&metadata[VECTOR_INDEX(first_unit + i)], META_CONTINUATION_BYTE,
+           (units - i) / META_ENTRIES_PER_BYTE);
+    for (i = 1; i < units - 1; i++) {
       rjn_metadata_set(rjn, first_unit + i, RJN_META_CONTINUATION);
     }
   } else {
-    assert(metadata[first_unit] != RJN_META_FREE);
-    assert(first_unit + 1 + sizeof(uint64_t) <= rjn->num_allocation_units);
+    assert(META_GET(metadata, first_unit) != RJN_META_FREE);
+    uint64_t size_start =
+        (first_unit + META_ENTRIES_PER_BYTE) / META_ENTRIES_PER_BYTE;
+    assert(size_start + sizeof(uint64_t) <=
+           (first_unit + units) / META_ENTRIES_PER_BYTE);
     rjn_metadata_set(rjn, first_unit, RJN_META_BINARY);
-    memcpy(&metadata[first_unit + 1], &units, sizeof(uint64_t));
+    memcpy(&metadata[size_start], &units, sizeof(uint64_t));
   }
 }
 
@@ -234,15 +312,29 @@ static uint64_t rjn_metadata_get_size(rjn_allocator *rjn, uint64_t first_unit) {
   assert(first_unit < rjn->num_allocation_units);
   uint8_t *metadata = rjn_metadata_vector(rjn);
   uint64_t size;
-  if (metadata[first_unit] == RJN_META_UNARY) {
+  if (META_GET(metadata, first_unit) == RJN_META_UNARY) {
     size = 1;
     while (first_unit + size < rjn->num_allocation_units &&
-           metadata[first_unit + size] == RJN_META_CONTINUATION) {
+           (first_unit + size) % META_ENTRIES_PER_BYTE &&
+           META_GET(metadata, first_unit + size) == RJN_META_CONTINUATION) {
+      size++;
+    }
+    while (first_unit + size + META_ENTRIES_PER_BYTE <=
+               rjn->num_allocation_units &&
+           metadata[VECTOR_INDEX(first_unit + size)] ==
+               META_CONTINUATION_BYTE) {
+      size += META_ENTRIES_PER_BYTE;
+    }
+    while (first_unit + size < rjn->num_allocation_units &&
+           META_GET(metadata, first_unit + size) == RJN_META_CONTINUATION) {
       size++;
     }
   } else {
     assert(first_unit + RJN_MIN_BINARY_UNITS <= rjn->num_allocation_units);
-    memcpy(&size, &metadata[first_unit + 1], sizeof(uint64_t));
+    memcpy(
+        &size,
+        &metadata[(first_unit + META_ENTRIES_PER_BYTE) / META_ENTRIES_PER_BYTE],
+        sizeof(uint64_t));
   }
   return size;
 }
@@ -252,12 +344,24 @@ static void rjn_metadata_erase_size(rjn_allocator *rjn, uint64_t first_unit,
   assert(first_unit + units <= rjn->num_allocation_units);
   uint8_t *metadata = rjn_metadata_vector(rjn);
   if (units < RJN_MIN_BINARY_UNITS) {
-    assert(metadata[first_unit] == RJN_META_UNARY);
-    for (uint64_t i = 1; i < units - 1; i++) {
-      metadata[first_unit + i] = RJN_META_CONTINUATION;
+    assert(META_GET(metadata, first_unit) == RJN_META_UNARY);
+    uint64_t i;
+    for (i = 1; i < units - 1 && (first_unit + i) % META_ENTRIES_PER_BYTE;
+         i++) {
+      rjn_metadata_set(rjn, first_unit + i, RJN_META_CONTINUATION);
+    }
+    while (i + META_ENTRIES_PER_BYTE <= units - 1) {
+      metadata[first_unit + i] = META_CONTINUATION_BYTE;
+      i += META_ENTRIES_PER_BYTE;
+    }
+    while (i < units - 1) {
+      rjn_metadata_set(rjn, first_unit + i, RJN_META_CONTINUATION);
+      i++;
     }
   } else {
-    memset(&metadata[first_unit + 1], RJN_META_CONTINUATION, sizeof(uint64_t));
+    memset(
+        &metadata[(first_unit + META_ENTRIES_PER_BYTE) / META_ENTRIES_PER_BYTE],
+        META_CONTINUATION_BYTE, sizeof(uint64_t));
   }
 }
 
@@ -365,19 +469,12 @@ static void rjn_lock_size_class(size_class *sc) {
       _mm_pause();
     }
   }
-  debug_printf("locked size class %p\n", (void *)sc);
 }
 
-static void rjn_unlock_size_class(size_class *sc) {
-  debug_printf("unlocked size class %p\n", (void *)sc);
-  sc->head.size = 0;
-}
+static void rjn_unlock_size_class(size_class *sc) { sc->head.size = 0; }
 
 static void rjn_prepend(rjn_allocator *rjn, size_class *sclass,
                         rjn_node *node) {
-  debug_printf("prepend size class %p\n  old head\n%s\n  node\n%s\n",
-               (void *)sclass, offset_string(rjn, sclass->head.next),
-               node_string(rjn, node));
   assert((void *)node != (void *)rjn);
   assert(node->next == 0);
   assert(node->prev == 0);
@@ -395,8 +492,6 @@ static void rjn_prepend(rjn_allocator *rjn, size_class *sclass,
 }
 
 static void rjn_remove(rjn_allocator *rjn, size_class *sclass, rjn_node *node) {
-  debug_printf("remove from size class %p\n  node\n%s\n", (void *)sclass,
-               node_string(rjn, node));
   assert((void *)node != (void *)rjn);
   assert(node->prev != 0);
   rjn_node *prev = rjn_pointer(rjn, node->prev);
@@ -438,11 +533,13 @@ static void rjn_walk_chunks(rjn_allocator *rjn, chunk_walk_func func,
       break;
     }
     assert(size);
-    for (uint64_t i = rjn_metadata_get(rjn, curr_unit) == RJN_META_BINARY
-                          ? 1 + sizeof(uint64_t)
-                          : 1;
-         i < size - 1; i++) {
-      assert(rjn_metadata_get(rjn, curr_unit + i) == RJN_META_CONTINUATION);
+    if (1 < RJN_DEBUG) {
+      for (uint64_t i = rjn_metadata_get(rjn, curr_unit) == RJN_META_BINARY
+                            ? 1 + sizeof(uint64_t)
+                            : 1;
+           i < size - 1; i++) {
+        assert(rjn_metadata_get(rjn, curr_unit + i) == RJN_META_CONTINUATION);
+      }
     }
     if (1 < size) {
       if (rjn_metadata_get(rjn, curr_unit) == RJN_META_FREE) {
@@ -540,6 +637,18 @@ debug_code static void rjn_validate(rjn_allocator *rjn) {
     ca->max_chunks = num_chunks;
     rjn_walk_chunks(rjn, rjn_collect_chunks, ca);
     rjn_validate_size_classes(rjn, ca);
+    if (RJN_DUMP_CHUNKS) {
+      printf("chunks\n");
+      for (uint64_t i = 0; i < ca->num_chunks; i++) {
+        printf("  chunk %12lu %12lu %s %s\n", ca->chunks[i].start,
+               ca->chunks[i].units,
+               metaname[rjn_metadata_get(rjn, ca->chunks[i].start)],
+               1 < ca->chunks[i].units
+                   ? metaname[rjn_metadata_get(
+                         rjn, ca->chunks[i].start + ca->chunks[i].units - 1)]
+                   : "");
+      }
+    }
     free(ca);
   }
 }
@@ -596,6 +705,7 @@ static void rjn_free_chunk(rjn_allocator *rjn, uint64_t start_unit,
   rjn_node *start_node;
 
 restart:
+  debug_printf("free_chunk %lu %lu\n", start_unit, units);
 
   assert(rjn_metadata_get(rjn, start_unit) == RJN_META_UNARY ||
          rjn_metadata_get(rjn, start_unit) == RJN_META_BINARY);
@@ -628,6 +738,8 @@ restart:
       uint64_t new_start = rjn_grab_predecessor_if_free(rjn, start_unit);
       if (new_start < start_unit) {
         rjn_node *pred_start_node = rjn_allocation_unit(rjn, new_start);
+        debug_printf("free_chunk merging %lu %lu with %lu %lu\n", start_unit,
+                     units, new_start, pred_start_node->size);
         size_class *pred_sc = rjn_find_size_class(rjn, pred_start_node->size);
         rjn_lock_size_class(pred_sc);
         rjn_remove(rjn, pred_sc, pred_start_node);
@@ -642,6 +754,8 @@ restart:
           rjn_grab_successor_if_free(rjn, start_unit, units);
       if (successor_start) {
         rjn_node *succ_start_node = rjn_allocation_unit(rjn, successor_start);
+        debug_printf("free_chunk merging %lu %lu with %lu %lu\n", start_unit,
+                     units, successor_start, succ_start_node->size);
         size_class *succ_sc = rjn_find_size_class(rjn, succ_start_node->size);
         rjn_lock_size_class(succ_sc);
         rjn_remove(rjn, succ_sc, succ_start_node);
@@ -664,6 +778,8 @@ restart:
       uint64_t new_start = rjn_grab_predecessor_if_free(rjn, start_unit);
       if (new_start < start_unit) {
         rjn_node *pred_start_node = rjn_allocation_unit(rjn, new_start);
+        debug_printf("free_chunk merging %lu %lu with %lu %lu\n", start_unit,
+                     units, new_start, pred_start_node->size);
         size_class *pred_sc = rjn_find_size_class(rjn, pred_start_node->size);
         rjn_lock_size_class(pred_sc);
         rjn_remove(rjn, pred_sc, pred_start_node);
@@ -692,6 +808,8 @@ restart:
             rjn_grab_successor_if_free(rjn, start_unit, units);
         if (successor_start) {
           rjn_node *succ_start_node = rjn_allocation_unit(rjn, successor_start);
+          debug_printf("free_chunk merging %lu %lu with %lu %lu\n", start_unit,
+                       units, successor_start, succ_start_node->size);
           size_class *succ_sc = rjn_find_size_class(rjn, succ_start_node->size);
           rjn_lock_size_class(succ_sc);
           rjn_remove(rjn, succ_sc, succ_start_node);
@@ -834,6 +952,7 @@ restart:
 }
 
 void *rjn_alloc(rjn_allocator *rjn, size_t alignment, size_t size) {
+  debug_printf("alloc %lu %lu\n", alignment, size);
   // Emulate the behavior of malloc(0), which returns a different, valid
   // pointer every time it is called.
   if (size == 0) {
@@ -887,19 +1006,23 @@ int rjn_init(rjn_allocator *rjn, size_t region_size,
   }
 
   uint64_t space = rjn->region_size - rjn->allocation_units_offset;
-  // The +1 is for each allocation unit's metadata byte.
   rjn->num_allocation_units = space / (allocation_unit_size + 1);
-  while (space < rjn->num_allocation_units * (allocation_unit_size + 1) +
+  while (space < rjn->num_allocation_units * allocation_unit_size +
+                     (rjn->num_allocation_units + META_ENTRIES_PER_BYTE - 1) /
+                         META_ENTRIES_PER_BYTE +
                      sizeof(size_class) * rjn_num_size_classes(rjn)) {
     rjn->num_allocation_units--;
   }
 
-  rjn->metadata_offset = rjn->region_size - rjn->num_allocation_units;
+  rjn->metadata_offset = rjn->region_size - (rjn->num_allocation_units +
+                                             META_ENTRIES_PER_BYTE - 1) /
+                                                META_ENTRIES_PER_BYTE;
   rjn->size_classes_offset =
       rjn->metadata_offset - sizeof(size_class) * rjn_num_size_classes(rjn);
 
   memset(rjn_metadata_vector(rjn), RJN_META_CONTINUATION,
-         rjn->num_allocation_units);
+         (rjn->num_allocation_units + META_ENTRIES_PER_BYTE - 1) /
+             META_ENTRIES_PER_BYTE);
 
   size_class *scs = rjn_size_classes(rjn);
   uint64_t num_scs = rjn_num_size_classes(rjn);
