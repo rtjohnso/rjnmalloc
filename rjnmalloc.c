@@ -915,6 +915,7 @@ restart:
     }
     rjn_remove(rjn, sc, node);
     rjn_unlock_size_class(sc);
+    uint64_t node_size = node->size;
 
     // Give back any alignment pad at the beginning
     if (pad_units) {
@@ -927,7 +928,7 @@ restart:
     }
 
     // Give back any remaining space at the end
-    if (required_units < node->size) {
+    if (required_units < node_size) {
       if (1 < allocated_units) {
         rjn_metadata_set(rjn, first_unit + pad_units + allocated_units - 1,
                          RJN_META_CONTINUATION);
@@ -937,7 +938,7 @@ restart:
       memset(rjn_allocation_unit(rjn, first_unit + pad_units + allocated_units),
              0, sizeof(rjn_node));
       rjn_free_chunk(rjn, first_unit + pad_units + allocated_units,
-                     node->size - pad_units - allocated_units);
+                     node_size - pad_units - allocated_units);
     }
 
     rjn_metadata_set_size(rjn, first_unit + pad_units, allocated_units);
