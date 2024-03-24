@@ -23,6 +23,8 @@ typedef struct test_params {
   uint64_t nrounds;
   uint64_t successful_allocations;
   uint64_t failed_allocations;
+  uint64_t successful_reallocations;
+  uint64_t failed_reallocations;
   int check_contents;
   allocation allocations[NALLOCATIONS];
 } test_params;
@@ -41,35 +43,50 @@ void malloc_test(test_params *params) {
 
   for (uint64_t j = 0; j < params->nrounds; j++) {
     int i = rand() % NALLOCATIONS;
-    if (allocations[i].p) {
-      if (params->check_contents) {
-        for (unsigned int k = 0; k < allocations[i].size; k++) {
-          assert(allocations[i].p[k] == allocations[i].c);
-        }
+    if (allocations[i].p && params->check_contents) {
+      for (unsigned int k = 0; k < allocations[i].size; k++) {
+        assert(allocations[i].p[k] == allocations[i].c);
       }
+    }
+
+    uint64_t newsize = exp(lsize * drand48());
+    uint64_t newalignment = exp(lsize * drand48());
+
+    if (rand() % 2) {
+      uint8_t *newp = rjn_realloc(hdr, allocations[i].p, newalignment, newsize);
+      if (newp || allocations[i].size == 0) {
+        allocations[i].p = newp;
+        allocations[i].size = newsize;
+        allocations[i].alignment = newalignment;
+        params->successful_reallocations++;
+      } else {
+        params->failed_reallocations++;
+      }
+    } else if (allocations[i].p) {
       rjn_free(hdr, allocations[i].p);
       allocations[i].p = NULL;
     } else {
-      allocations[i].size = exp(lsize * drand48());
-      allocations[i].alignment = exp(lsize * drand48());
-      allocations[i].p =
-          rjn_alloc(hdr, allocations[i].alignment, allocations[i].size);
-      allocations[i].c = rand() % 256;
+      allocations[i].p = rjn_alloc(hdr, newalignment, newsize);
       if (allocations[i].p) {
+        allocations[i].size = newsize;
+        allocations[i].alignment = newalignment;
         params->successful_allocations++;
-        assert(rstart <= allocations[i].p);
-        assert(allocations[i].p + allocations[i].size <= rend);
-        if (allocations[i].alignment) {
-          assert(((uintptr_t)allocations[i].p) % allocations[i].alignment == 0);
-        }
-        if (params->check_contents) {
-          memset(allocations[i].p, allocations[i].c, allocations[i].size);
-        } else {
-          memset(allocations[i].p, allocations[i].c,
-                 MIN(allocations[i].size, au_size));
-        }
       } else {
         params->failed_allocations++;
+      }
+    }
+    allocations[i].c = rand() % 256;
+    if (allocations[i].p) {
+      assert(rstart <= allocations[i].p);
+      assert(allocations[i].p + allocations[i].size <= rend);
+      if (allocations[i].alignment) {
+        assert(((uintptr_t)allocations[i].p) % allocations[i].alignment == 0);
+      }
+      if (params->check_contents) {
+        memset(allocations[i].p, allocations[i].c, allocations[i].size);
+      } else {
+        memset(allocations[i].p, allocations[i].c,
+               MIN(allocations[i].size, au_size));
       }
     }
   }
@@ -107,10 +124,11 @@ int main(int argc, char **argv) {
   int nrounds = 1000000;
   int nthreads = 4;
   int check_contents = 0;
+  uint64_t seed = 0;
 
   int opt;
   char *endptr;
-  while ((opt = getopt(argc, argv, ":cn:t:")) != -1) {
+  while ((opt = getopt(argc, argv, ":cn:t:s:")) != -1) {
     switch (opt) {
     case 'c':
       check_contents = 1;
@@ -128,6 +146,15 @@ int main(int argc, char **argv) {
         printf("Invalid number of threads: %s\n", optarg);
         usage(argv[0]);
       }
+      break;
+    case 's':
+      seed = strtoull(optarg, &endptr, 0);
+      if (*endptr != '\0') {
+        printf("Invalid seed: %s\n", optarg);
+        usage(argv[0]);
+      }
+      srand(seed);
+      srand48(rand());
       break;
     case ':':
       printf("Option -%c requires an operand\n", optopt);
@@ -149,6 +176,8 @@ int main(int argc, char **argv) {
     params[i].nrounds = nrounds;
     params[i].successful_allocations = 0;
     params[i].failed_allocations = 0;
+    params[i].successful_reallocations = 0;
+    params[i].failed_reallocations = 0;
     params[i].check_contents = check_contents;
   }
 
@@ -174,13 +203,21 @@ int main(int argc, char **argv) {
 
   uint64_t total_successful_allocations = 0;
   uint64_t total_failed_allocations = 0;
+  uint64_t total_successful_reallocations = 0;
+  uint64_t total_failed_reallocations = 0;
   for (int i = 0; i < nthreads; i++) {
     total_successful_allocations += params[i].successful_allocations;
     total_failed_allocations += params[i].failed_allocations;
+    total_successful_reallocations += params[i].successful_reallocations;
+    total_failed_reallocations += params[i].failed_reallocations;
   }
   printf("Total successful allocations: %" PRIu64 "\n",
          total_successful_allocations);
   printf("Total failed allocations: %" PRIu64 "\n", total_failed_allocations);
+  printf("Total successful reallocations: %" PRIu64 "\n",
+         total_successful_reallocations);
+  printf("Total failed reallocations: %" PRIu64 "\n",
+         total_failed_reallocations);
 
   printf("Cleaning up\n");
 

@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define RJN_DEBUG 0
-#define RJN_DUMP_CHUNKS 1
+#define RJN_DUMP_CHUNKS 0
 #define debug_code __attribute__((unused))
 #if RJN_DEBUG
 #define debug_printf(...) printf(__VA_ARGS__)
@@ -61,22 +61,22 @@ static const char *metaname[] = {"C", "U", "B", "F"};
 /*
  * Elementary operations
  */
-uint64_t rjn_offset(rjn_allocator *rjn, void *ptr) {
+uint64_t rjn_offset(const rjn_allocator *rjn, const void *ptr) {
   assert((uint8_t *)ptr >= (uint8_t *)rjn);
   assert((uint8_t *)ptr < (uint8_t *)rjn + rjn->region_size);
   return (uint8_t *)ptr - (uint8_t *)rjn;
 }
 
-static void *rjn_pointer(rjn_allocator *rjn, uint64_t offset) {
+static void *rjn_pointer(const rjn_allocator *rjn, uint64_t offset) {
   assert(offset < rjn->region_size);
   return (void *)((uint8_t *)rjn + offset);
 }
 
-static uint8_t *rjn_allocation_units(rjn_allocator *rjn) {
+static uint8_t *rjn_allocation_units(const rjn_allocator *rjn) {
   return (uint8_t *)rjn_pointer(rjn, rjn->allocation_units_offset);
 }
 
-static rjn_node *rjn_allocation_unit(rjn_allocator *rjn, uint64_t i) {
+static rjn_node *rjn_allocation_unit(const rjn_allocator *rjn, uint64_t i) {
   assert(i < rjn->num_allocation_units);
   uint8_t *p = rjn_allocation_units(rjn);
   return (rjn_node *)(p + i * rjn->allocation_unit_size);
@@ -99,18 +99,18 @@ static rjn_node *rjn_allocation_unit(rjn_allocator *rjn, uint64_t i) {
                              ((i) % META_ENTRIES_PER_BYTE)))
 #define META_CONTINUATION_BYTE (RJN_META_CONTINUATION * 0xcc)
 
-static uint8_t *rjn_metadata_vector(rjn_allocator *rjn) {
+static uint8_t *rjn_metadata_vector(const rjn_allocator *rjn) {
   return (uint8_t *)rjn_pointer(rjn, rjn->metadata_offset);
 }
 
-static uint8_t rjn_metadata_get(rjn_allocator *rjn, uint64_t unit) {
+static uint8_t rjn_metadata_get(const rjn_allocator *rjn, uint64_t unit) {
   assert(unit < rjn->num_allocation_units);
-  uint8_t *metadata = rjn_metadata_vector(rjn);
+  const uint8_t *metadata = rjn_metadata_vector(rjn);
   return META_GET(metadata, unit);
 }
 
-static int rjn_metadata_cas(rjn_allocator *rjn, uint64_t unit, uint8_t old,
-                            uint8_t new) {
+static int rjn_metadata_cas(const rjn_allocator *rjn, uint64_t unit,
+                            uint8_t old, uint8_t new) {
   assert(unit < rjn->num_allocation_units);
   uint8_t *metadata = rjn_metadata_vector(rjn);
   uint8_t mask = BYTE_INSERT(old ^ new, unit);
@@ -125,7 +125,8 @@ static int rjn_metadata_cas(rjn_allocator *rjn, uint64_t unit, uint8_t old,
   return 1;
 }
 
-static void rjn_metadata_set(rjn_allocator *rjn, uint64_t unit, uint8_t value) {
+static void rjn_metadata_set(const rjn_allocator *rjn, uint64_t unit,
+                             uint8_t value) {
   assert(unit < rjn->num_allocation_units);
   uint8_t *metadata = rjn_metadata_vector(rjn);
   debug_printf("metadata_set %lu %s %s\n", unit,
@@ -152,7 +153,8 @@ static void rjn_metadata_set(rjn_allocator *rjn, uint64_t unit, uint8_t value) {
  * else
      return 0
  */
-static int rjn_metadata_try_set_end_to_free(rjn_allocator *rjn, uint64_t unit) {
+static int rjn_metadata_try_set_end_to_free(const rjn_allocator *rjn,
+                                            uint64_t unit) {
   assert(unit < rjn->num_allocation_units);
   if (unit == rjn->num_allocation_units - 1) {
     rjn_metadata_set(rjn, unit, RJN_META_FREE);
@@ -193,7 +195,7 @@ static int rjn_metadata_try_set_end_to_free(rjn_allocator *rjn, uint64_t unit) {
  * else
      return 0
  */
-static int rjn_metadata_try_set_start_to_free(rjn_allocator *rjn,
+static int rjn_metadata_try_set_start_to_free(const rjn_allocator *rjn,
                                               uint64_t unit) {
   assert(unit < rjn->num_allocation_units);
   if (unit == 0) {
@@ -240,7 +242,7 @@ static int rjn_metadata_try_set_start_to_free(rjn_allocator *rjn,
  * else
      return 0
  */
-static int rjn_metadata_try_set_singleton_to_free(rjn_allocator *rjn,
+static int rjn_metadata_try_set_singleton_to_free(const rjn_allocator *rjn,
                                                   uint64_t unit) {
   assert(unit < rjn->num_allocation_units);
   if (unit == 0 && unit == rjn->num_allocation_units - 1) {
@@ -280,12 +282,14 @@ static int rjn_metadata_try_set_singleton_to_free(rjn_allocator *rjn,
   }
 }
 
-static void rjn_metadata_set_size(rjn_allocator *rjn, uint64_t first_unit,
+static void rjn_metadata_set_size(const rjn_allocator *rjn, uint64_t first_unit,
                                   uint64_t units) {
   assert(first_unit + units <= rjn->num_allocation_units);
   uint8_t *metadata = rjn_metadata_vector(rjn);
+  assert(META_GET(metadata, first_unit) == RJN_META_UNARY ||
+         META_GET(metadata, first_unit) == RJN_META_BINARY);
   if (units < RJN_MIN_BINARY_UNITS) {
-    assert(META_GET(metadata, first_unit) == RJN_META_UNARY);
+    rjn_metadata_set(rjn, first_unit, RJN_META_UNARY);
     assert(first_unit + units <= rjn->num_allocation_units);
     uint64_t i;
     for (i = 1; i < units - 1 && (first_unit + i) % META_ENTRIES_PER_BYTE;
@@ -298,7 +302,6 @@ static void rjn_metadata_set_size(rjn_allocator *rjn, uint64_t first_unit,
       rjn_metadata_set(rjn, first_unit + i, RJN_META_CONTINUATION);
     }
   } else {
-    assert(META_GET(metadata, first_unit) != RJN_META_FREE);
     uint64_t size_start =
         (first_unit + META_ENTRIES_PER_BYTE) / META_ENTRIES_PER_BYTE;
     assert(size_start + sizeof(uint64_t) <=
@@ -308,7 +311,8 @@ static void rjn_metadata_set_size(rjn_allocator *rjn, uint64_t first_unit,
   }
 }
 
-static uint64_t rjn_metadata_get_size(rjn_allocator *rjn, uint64_t first_unit) {
+static uint64_t rjn_metadata_get_size(const rjn_allocator *rjn,
+                                      uint64_t first_unit) {
   assert(first_unit < rjn->num_allocation_units);
   uint8_t *metadata = rjn_metadata_vector(rjn);
   uint64_t size;
@@ -339,8 +343,8 @@ static uint64_t rjn_metadata_get_size(rjn_allocator *rjn, uint64_t first_unit) {
   return size;
 }
 
-static void rjn_metadata_erase_size(rjn_allocator *rjn, uint64_t first_unit,
-                                    uint64_t units) {
+static void rjn_metadata_erase_size(const rjn_allocator *rjn,
+                                    uint64_t first_unit, uint64_t units) {
   assert(first_unit + units <= rjn->num_allocation_units);
   uint8_t *metadata = rjn_metadata_vector(rjn);
   if (units < RJN_MIN_BINARY_UNITS) {
@@ -369,8 +373,9 @@ static void rjn_metadata_erase_size(rjn_allocator *rjn, uint64_t first_unit,
 /*
  * Debug printing code
  */
-debug_code static void node_to_string(rjn_allocator *rjn, rjn_node *node,
-                                      char *buffer, size_t buffer_size) {
+debug_code static void node_to_string(const rjn_allocator *rjn,
+                                      const rjn_node *node, char *buffer,
+                                      size_t buffer_size) {
   uint64_t offset = rjn_offset(rjn, node);
   assert((offset - rjn->allocation_units_offset) % rjn->allocation_unit_size ==
          0);
@@ -432,17 +437,17 @@ debug_code static void node_to_string(rjn_allocator *rjn, rjn_node *node,
 
 // Size class i contains chunks of size in the range [2^i, 2^(i+1)) allocation
 // units.
-static uint64_t rjn_num_size_classes(rjn_allocator *rjn) {
+static uint64_t rjn_num_size_classes(const rjn_allocator *rjn) {
   return 64 - _lzcnt_u64(rjn->num_allocation_units);
 }
 
-static size_class *rjn_size_classes(rjn_allocator *rjn) {
+static size_class *rjn_size_classes(const rjn_allocator *rjn) {
   return (size_class *)rjn_pointer(rjn, rjn->size_classes_offset);
 }
 
 /* Return the size class where a free chunk of size 'units' allocation units
    should be stored. */
-static unsigned int rjn_find_size_class_index(rjn_allocator *rjn,
+static unsigned int rjn_find_size_class_index(const rjn_allocator *rjn,
                                               size_t units) {
   uint64_t num_sclasses = rjn_num_size_classes(rjn);
 
@@ -455,7 +460,7 @@ static unsigned int rjn_find_size_class_index(rjn_allocator *rjn,
   }
 }
 
-static size_class *rjn_find_size_class(rjn_allocator *rjn, size_t units) {
+static size_class *rjn_find_size_class(const rjn_allocator *rjn, size_t units) {
   unsigned int scidx = rjn_find_size_class_index(rjn, units);
   if (scidx < rjn_num_size_classes(rjn)) {
     return &rjn_size_classes(rjn)[scidx];
@@ -474,7 +479,7 @@ static void rjn_lock_size_class(size_class *sc) {
 
 static void rjn_unlock_size_class(size_class *sc) { sc->head.size = 0; }
 
-static void rjn_prepend(rjn_allocator *rjn, size_class *sclass,
+static void rjn_prepend(const rjn_allocator *rjn, size_class *sclass,
                         rjn_node *node) {
   assert((void *)node != (void *)rjn);
   assert(node->next == 0);
@@ -492,7 +497,8 @@ static void rjn_prepend(rjn_allocator *rjn, size_class *sclass,
   sclass->num_units += node->size;
 }
 
-static void rjn_remove(rjn_allocator *rjn, size_class *sclass, rjn_node *node) {
+static void rjn_remove(const rjn_allocator *rjn, size_class *sclass,
+                       rjn_node *node) {
   assert((void *)node != (void *)rjn);
   assert(node->prev != 0);
   rjn_node *prev = rjn_pointer(rjn, node->prev);
@@ -521,10 +527,10 @@ static void rjn_walk_chunks(rjn_allocator *rjn, chunk_walk_func func,
   while (curr_unit < rjn->num_allocation_units) {
     uint64_t size = 0;
     switch (rjn_metadata_get(rjn, curr_unit)) {
-    case RJN_META_FREE:
+    case RJN_META_FREE: {
       rjn_node *node = rjn_allocation_unit(rjn, curr_unit);
       size = node->size;
-      break;
+    } break;
     case RJN_META_UNARY:
     case RJN_META_BINARY:
       size = rjn_metadata_get_size(rjn, curr_unit);
@@ -586,7 +592,7 @@ static int compare_chunk_start(const void *a, const void *b) {
   }
 }
 
-static uint64_t rjn_find_chunk_in_array(chunk_array *ca, uint64_t start) {
+static uint64_t rjn_find_chunk_in_array(const chunk_array *ca, uint64_t start) {
   chunk key = {.start = start};
   void *p = bsearch(&key, ca->chunks, ca->num_chunks, sizeof(chunk),
                     compare_chunk_start);
@@ -607,7 +613,8 @@ static void rjn_collect_chunks(rjn_allocator *rjn, uint64_t start_unit,
   ca->num_chunks++;
 }
 
-static void rjn_validate_size_classes(rjn_allocator *rjn, chunk_array *ca) {
+static void rjn_validate_size_classes(const rjn_allocator *rjn,
+                                      chunk_array *ca) {
   uint64_t num_sclasses = rjn_num_size_classes(rjn);
   size_class *scs = rjn_size_classes(rjn);
   for (uint64_t i = 0; i < num_sclasses; i++) {
@@ -658,7 +665,7 @@ debug_code static void rjn_validate(rjn_allocator *rjn) {
  * Chunk freeing functions
  */
 
-static uint64_t rjn_grab_predecessor_if_free(rjn_allocator *rjn,
+static uint64_t rjn_grab_predecessor_if_free(const rjn_allocator *rjn,
                                              uint64_t my_start) {
   if (my_start == 0) {
     return 0;
@@ -680,7 +687,7 @@ static uint64_t rjn_grab_predecessor_if_free(rjn_allocator *rjn,
   return pred_start;
 }
 
-static uint64_t rjn_grab_successor_if_free(rjn_allocator *rjn,
+static uint64_t rjn_grab_successor_if_free(const rjn_allocator *rjn,
                                            uint64_t my_start,
                                            uint64_t my_units) {
   uint64_t succ_start = my_start + my_units;
@@ -701,9 +708,9 @@ static uint64_t rjn_grab_successor_if_free(rjn_allocator *rjn,
   return succ_start;
 }
 
-static void rjn_free_chunk(rjn_allocator *rjn, uint64_t start_unit,
+static void rjn_free_chunk(const rjn_allocator *rjn, uint64_t start_unit,
                            uint64_t units) {
-  rjn_node *start_node;
+  rjn_node *start_node = NULL;
 
 restart:
   debug_printf("free_chunk %lu %lu\n", start_unit, units);
@@ -848,13 +855,14 @@ void rjn_free(rjn_allocator *rjn, void *ptr) {
 
 static void *rjn_alloc_from_size_class(rjn_allocator *rjn, unsigned int scidx,
                                        size_t alignment_bytes, size_t bytes) {
-restart:
-  rjn_validate(rjn);
-
   size_class *sc = &rjn_size_classes(rjn)[scidx];
   if (!sc->num_chunks) {
     return NULL;
   }
+
+restart:
+  rjn_validate(rjn);
+
   rjn_lock_size_class(sc);
 
   uint64_t next_off;
@@ -981,6 +989,99 @@ void *rjn_alloc(rjn_allocator *rjn, size_t alignment, size_t size) {
       rjn, rjn_find_size_class_index(rjn, min_units), alignment, size);
 }
 
+void *rjn_realloc(rjn_allocator *rjn, void *ptr, size_t alignment,
+                  size_t new_bytes) {
+  debug_printf("realloc %p %lu %lu\n", ptr, alignment, new_bytes);
+  rjn_validate(rjn);
+
+  if (ptr == NULL) {
+    return rjn_alloc(rjn, alignment, new_bytes);
+  }
+  if (new_bytes == 0) {
+    rjn_free(rjn, ptr);
+    return NULL;
+  }
+  uint64_t first_unit = (rjn_offset(rjn, ptr) - rjn->allocation_units_offset) /
+                        rjn->allocation_unit_size;
+  uint64_t old_units = rjn_metadata_get_size(rjn, first_unit);
+  assert(old_units != 0);
+  uint64_t old_bytes = old_units * rjn->allocation_unit_size -
+                       ((uint64_t)ptr % rjn->allocation_unit_size);
+
+  size_t copy_size = old_bytes < new_bytes ? old_bytes : new_bytes;
+
+  if ((uint64_t)ptr % alignment) {
+    void *new_ptr = rjn_alloc(rjn, alignment, new_bytes);
+    if (new_ptr) {
+      memcpy(new_ptr, ptr, copy_size);
+      rjn_free(rjn, ptr);
+    }
+    return new_ptr;
+  }
+
+  uint64_t required_units = (((uint64_t)ptr % rjn->allocation_unit_size) +
+                             new_bytes + rjn->allocation_unit_size - 1) /
+                            rjn->allocation_unit_size;
+
+  if (required_units == old_units) {
+    return ptr;
+  }
+
+  if (new_bytes <= old_bytes) {
+    rjn_metadata_erase_size(rjn, first_unit, old_units);
+    if (1 < required_units) {
+      rjn_metadata_set(rjn, first_unit + required_units - 1,
+                       RJN_META_CONTINUATION);
+    }
+    rjn_metadata_set(rjn, first_unit + required_units, RJN_META_UNARY);
+    memset(rjn_allocation_unit(rjn, first_unit + required_units), 0,
+           sizeof(rjn_node));
+    rjn_free_chunk(rjn, first_unit + required_units,
+                   old_units - required_units);
+    rjn_metadata_set_size(rjn, first_unit, required_units);
+    return ptr;
+  } else {
+    uint64_t succ_start =
+        rjn_grab_successor_if_free(rjn, first_unit, old_units);
+    if (first_unit < succ_start) {
+      rjn_node *succ_start_node = rjn_allocation_unit(rjn, succ_start);
+      size_class *sc = rjn_find_size_class(rjn, succ_start_node->size);
+      if (new_bytes <=
+          old_bytes + succ_start_node->size * rjn->allocation_unit_size) {
+        rjn_lock_size_class(sc);
+        rjn_remove(rjn, sc, succ_start_node);
+        rjn_unlock_size_class(sc);
+        rjn_metadata_set(rjn, succ_start, RJN_META_CONTINUATION);
+        rjn_metadata_erase_size(rjn, first_unit, old_units);
+        if (required_units < old_units + succ_start_node->size) {
+          assert(1 < required_units);
+          rjn_metadata_set(rjn, first_unit + required_units - 1,
+                           RJN_META_CONTINUATION);
+          rjn_metadata_set(rjn, first_unit + required_units, RJN_META_UNARY);
+          memset(rjn_allocation_unit(rjn, first_unit + required_units), 0,
+                 sizeof(rjn_node));
+          rjn_free_chunk(rjn, first_unit + required_units,
+                         old_units + succ_start_node->size - required_units);
+        }
+        rjn_metadata_set_size(rjn, first_unit, required_units);
+        return ptr;
+      } else {
+        rjn_lock_size_class(sc);
+        rjn_remove(rjn, sc, succ_start_node);
+        rjn_unlock_size_class(sc);
+        rjn_free_chunk(rjn, succ_start, succ_start_node->size);
+      }
+    }
+
+    void *new_ptr = rjn_alloc(rjn, alignment, new_bytes);
+    if (new_ptr) {
+      memcpy(new_ptr, ptr, copy_size);
+      rjn_free(rjn, ptr);
+    }
+    return new_ptr;
+  }
+}
+
 /*
  * Init and miscellaneous functions
  */
@@ -1052,40 +1153,40 @@ void rjn_deinit(rjn_allocator *rjn) {
   // Nothing to do.
 }
 
-size_t rjn_size(rjn_allocator *rjn) {
+size_t rjn_size(const rjn_allocator *rjn) {
   return rjn->num_allocation_units * rjn->allocation_unit_size;
 }
 
-size_t rjn_allocation_unit_size(rjn_allocator *rjn) {
+size_t rjn_allocation_unit_size(const rjn_allocator *rjn) {
   return rjn->allocation_unit_size;
 }
 
-void *rjn_start(rjn_allocator *rjn) {
+void *rjn_start(const rjn_allocator *rjn) {
   return rjn_pointer(rjn, rjn->allocation_units_offset);
 }
 
-void *rjn_end(rjn_allocator *rjn) {
+void *rjn_end(const rjn_allocator *rjn) {
   return rjn_pointer(rjn,
                      rjn->allocation_units_offset +
                          rjn->num_allocation_units * rjn->allocation_unit_size);
 }
 
-void rjn_print_allocation_stats(rjn_allocator *rjn) {
+void rjn_print_allocation_stats(const rjn_allocator *rjn) {
   uint64_t num_sclasses = rjn_num_size_classes(rjn);
   size_class *scs = rjn_size_classes(rjn);
 
   uint64_t total_free_units = 0;
-  uint64_t total_free_chuynks = 0;
+  uint64_t total_free_chunks = 0;
   printf("----------------------------------------\n");
   for (uint64_t i = 0; i < num_sclasses; i++) {
     size_class *sc = &scs[i];
     total_free_units += sc->num_units;
-    total_free_chuynks += sc->num_chunks;
+    total_free_chunks += sc->num_chunks;
     printf("size class %2" PRIu64 ": %12" PRIu64 " chunks, %12" PRIu64
            " units\n",
            i, sc->num_chunks, sc->num_units);
   }
-  printf("total free chunks: %" PRIu64 "\n", total_free_chuynks);
+  printf("total free chunks: %" PRIu64 "\n", total_free_chunks);
   printf("total free units: %" PRIu64 "\n", total_free_units);
   printf("total free bytes: %" PRIu64 "\n",
          total_free_units * rjn->allocation_unit_size);
