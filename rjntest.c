@@ -24,7 +24,11 @@ void *bounded_default_alloc(void *state, size_t alignment, size_t size) {
   return aligned_alloc(alignment, size);
 }
 
-void bounded_default_free(void *state, void *ptr) { free(ptr); }
+void bounded_default_free(void *state, void *ptr) {
+  bounded_default_allocator *a = (bounded_default_allocator *)state;
+  a->allocated -= malloc_usable_size(ptr);
+  free(ptr);
+}
 
 void *bounded_default_realloc(void *state, void *ptr, size_t alignment,
                               size_t size) {
@@ -41,6 +45,8 @@ allocator_ops bounded_default_allocator_ops = {
 
 char rjnbuf[1 << 30];
 
+bounded_default_allocator bd_allocator = {sizeof(rjnbuf), 0};
+
 typedef struct allocation {
   uint8_t *p;
   uint64_t alignment;
@@ -50,10 +56,13 @@ typedef struct allocation {
 
 #define NALLOCATIONS (1000)
 
+typedef enum alignment_mode { NONE, ARBITRARY } alignment_mode;
+
 typedef struct test_params {
   void *state;
   allocator_ops *ops;
   uint64_t nrounds;
+  alignment_mode al;
   uint64_t successful_allocations;
   uint64_t failed_allocations;
   uint64_t successful_reallocations;
@@ -81,7 +90,8 @@ void malloc_test(test_params *params) {
     }
 
     uint64_t newsize = exp(lsize * drand48());
-    uint64_t newalignment = exp(lsize * drand48());
+    uint64_t newalignment =
+        params->al == ARBITRARY ? exp(lsize * drand48()) : sizeof(void *);
 
     if (rand() % 2) {
       uint8_t *newp =
@@ -142,7 +152,15 @@ void cleanup_test(test_params *params) {
 }
 
 __attribute__((noreturn)) void usage(char *argv0) {
-  printf("Usage: %s [-c] [-n nrounds] [-t nthreads]\n", argv0);
+  printf("Usage: %s [-a allocator] [-c] [-n nrounds] [-t nthreads] [-l "
+         "alignment-mode] [-s seed]\n",
+         argv0);
+  printf("  -a: allocator (\"malloc\", \"rjn\")\n");
+  printf("  -c: check contents of allocations\n");
+  printf("  -n: number of rounds\n");
+  printf("  -t: number of threads\n");
+  printf("  -l: alignment mode (\"none\", \"arbitrary\")\n");
+  printf("  -s: seed\n");
   exit(EXIT_FAILURE);
 }
 
@@ -151,11 +169,16 @@ int main(int argc, char **argv) {
   int nthreads = 4;
   int check_contents = 0;
   uint64_t seed = 0;
+  char *allocator = "rjn";
+  alignment_mode alignment = NONE;
 
   int opt;
   char *endptr;
-  while ((opt = getopt(argc, argv, ":cn:t:s:")) != -1) {
+  while ((opt = getopt(argc, argv, ":a:cn:t:l:s:")) != -1) {
     switch (opt) {
+    case 'a':
+      allocator = optarg;
+      break;
     case 'c':
       check_contents = 1;
       break;
@@ -170,6 +193,16 @@ int main(int argc, char **argv) {
       nthreads = strtoull(optarg, &endptr, 0);
       if (*endptr != '\0') {
         printf("Invalid number of threads: %s\n", optarg);
+        usage(argv[0]);
+      }
+      break;
+    case 'l':
+      if (strcmp(optarg, "none") == 0) {
+        alignment = NONE;
+      } else if (strcmp(optarg, "arbitrary") == 0) {
+        alignment = ARBITRARY;
+      } else {
+        printf("Invalid alignment mode: %s\n", optarg);
         usage(argv[0]);
       }
       break;
@@ -191,16 +224,29 @@ int main(int argc, char **argv) {
     }
   }
 
+  allocator_ops *ops = NULL;
+  void *state = NULL;
+  if (strcmp(allocator, "malloc") == 0) {
+    ops = &bounded_default_allocator_ops;
+    state = &bd_allocator;
+  } else if (strcmp(allocator, "rjn") == 0) {
+    ops = &rjn_allocator_ops;
+    rjn *hdr = (rjn *)rjnbuf;
+    int r = rjn_init(hdr, sizeof(rjnbuf), 1 << 6);
+    assert(r == 0);
+    state = hdr;
+  } else {
+    printf("Unknown allocator: %s\n", allocator);
+    usage(argv[0]);
+  }
+
   test_params *params = (test_params *)malloc(sizeof(test_params) * nthreads);
 
-  rjn *hdr = (rjn *)rjnbuf;
-  int r = rjn_init(hdr, sizeof(rjnbuf), 1 << 6);
-  assert(r == 0);
-
   for (int i = 0; i < nthreads; i++) {
-    params[i].state = hdr;
-    params[i].ops = &rjn_allocator_ops;
+    params[i].state = state;
+    params[i].ops = ops;
     params[i].nrounds = nrounds;
+    params[i].al = alignment;
     params[i].successful_allocations = 0;
     params[i].failed_allocations = 0;
     params[i].successful_reallocations = 0;
@@ -224,9 +270,10 @@ int main(int argc, char **argv) {
     malloc_test(&params[0]);
   }
 
-  printf("Allocation stats after test:\n");
-
-  rjn_print_allocation_stats(hdr);
+  if (ops == &rjn_allocator_ops) {
+    printf("Allocation stats after test:\n");
+    rjn_print_allocation_stats((rjn *)state);
+  }
 
   uint64_t total_successful_allocations = 0;
   uint64_t total_failed_allocations = 0;
@@ -252,11 +299,11 @@ int main(int argc, char **argv) {
     cleanup_test(&params[i]);
   }
 
-  printf("Allocation stats after cleanup:\n");
-
-  rjn_print_allocation_stats(hdr);
-
-  rjn_deinit(hdr);
+  if (ops == &rjn_allocator_ops) {
+    printf("Allocation stats after cleanup:\n");
+    rjn_print_allocation_stats(state);
+    rjn_deinit(state);
+  }
 
   return 0;
 }
