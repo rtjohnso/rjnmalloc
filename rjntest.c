@@ -2,12 +2,44 @@
 #define _XOPEN_SOURCE
 #include <assert.h>
 #include <inttypes.h>
+#include <malloc.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+typedef struct bounded_default_allocator {
+  size_t max_size;
+  size_t allocated;
+} bounded_default_allocator;
+
+void *bounded_default_alloc(void *state, size_t alignment, size_t size) {
+  bounded_default_allocator *a = (bounded_default_allocator *)state;
+  if (a->allocated + size > a->max_size) {
+    return NULL;
+  }
+  a->allocated += size;
+  return aligned_alloc(alignment, size);
+}
+
+void bounded_default_free(void *state, void *ptr) { free(ptr); }
+
+void *bounded_default_realloc(void *state, void *ptr, size_t alignment,
+                              size_t size) {
+  bounded_default_allocator *a = (bounded_default_allocator *)state;
+  if (a->allocated + size - malloc_usable_size(ptr) > a->max_size) {
+    return NULL;
+  }
+  a->allocated += size;
+  return realloc(ptr, size);
+}
+
+allocator_ops bounded_default_allocator_ops = {
+    bounded_default_alloc, bounded_default_free, bounded_default_realloc};
+
+char rjnbuf[1 << 30];
 
 typedef struct allocation {
   uint8_t *p;
@@ -19,7 +51,8 @@ typedef struct allocation {
 #define NALLOCATIONS (1000)
 
 typedef struct test_params {
-  rjn_allocator *hdr;
+  void *state;
+  allocator_ops *ops;
   uint64_t nrounds;
   uint64_t successful_allocations;
   uint64_t failed_allocations;
@@ -32,14 +65,12 @@ typedef struct test_params {
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 void malloc_test(test_params *params) {
-  rjn_allocator *hdr = params->hdr;
+  void *hdr = params->state;
+  allocator_ops *ops = params->ops;
   allocation *allocations = params->allocations;
   memset(params->allocations, 0, sizeof(params->allocations));
 
-  double lsize = log(rjn_size(hdr));
-  uint8_t *rstart = (uint8_t *)rjn_start(hdr);
-  uint8_t *rend = (uint8_t *)rjn_end(hdr);
-  size_t au_size = rjn_allocation_unit_size(hdr);
+  double lsize = log(sizeof(rjnbuf));
 
   for (uint64_t j = 0; j < params->nrounds; j++) {
     int i = rand() % NALLOCATIONS;
@@ -53,7 +84,8 @@ void malloc_test(test_params *params) {
     uint64_t newalignment = exp(lsize * drand48());
 
     if (rand() % 2) {
-      uint8_t *newp = rjn_realloc(hdr, allocations[i].p, newalignment, newsize);
+      uint8_t *newp =
+          ops->realloc(hdr, allocations[i].p, newalignment, newsize);
       if (newp || allocations[i].size == 0) {
         allocations[i].p = newp;
         allocations[i].size = newsize;
@@ -63,10 +95,10 @@ void malloc_test(test_params *params) {
         params->failed_reallocations++;
       }
     } else if (allocations[i].p) {
-      rjn_free(hdr, allocations[i].p);
+      ops->free(hdr, allocations[i].p);
       allocations[i].p = NULL;
     } else {
-      allocations[i].p = rjn_alloc(hdr, newalignment, newsize);
+      allocations[i].p = ops->alloc(hdr, newalignment, newsize);
       if (allocations[i].p) {
         allocations[i].size = newsize;
         allocations[i].alignment = newalignment;
@@ -77,16 +109,11 @@ void malloc_test(test_params *params) {
     }
     allocations[i].c = rand() % 256;
     if (allocations[i].p) {
-      assert(rstart <= allocations[i].p);
-      assert(allocations[i].p + allocations[i].size <= rend);
       if (allocations[i].alignment) {
         assert(((uintptr_t)allocations[i].p) % allocations[i].alignment == 0);
       }
       if (params->check_contents) {
         memset(allocations[i].p, allocations[i].c, allocations[i].size);
-      } else {
-        memset(allocations[i].p, allocations[i].c,
-               MIN(allocations[i].size, au_size));
       }
     }
   }
@@ -98,7 +125,8 @@ void *malloc_test_thread(void *p) {
 }
 
 void cleanup_test(test_params *params) {
-  rjn_allocator *hdr = params->hdr;
+  void *hdr = params->state;
+  allocator_ops *ops = params->ops;
   allocation *allocations = params->allocations;
   for (int i = 0; i < NALLOCATIONS; i++) {
     if (allocations[i].p) {
@@ -107,13 +135,11 @@ void cleanup_test(test_params *params) {
           assert(allocations[i].p[j] == allocations[i].c);
         }
       }
-      rjn_free(hdr, allocations[i].p);
+      ops->free(hdr, allocations[i].p);
       allocations[i].p = NULL;
     }
   }
 }
-
-char rjnbuf[1 << 30];
 
 __attribute__((noreturn)) void usage(char *argv0) {
   printf("Usage: %s [-c] [-n nrounds] [-t nthreads]\n", argv0);
@@ -167,12 +193,13 @@ int main(int argc, char **argv) {
 
   test_params *params = (test_params *)malloc(sizeof(test_params) * nthreads);
 
-  rjn_allocator *hdr = (rjn_allocator *)rjnbuf;
+  rjn *hdr = (rjn *)rjnbuf;
   int r = rjn_init(hdr, sizeof(rjnbuf), 1 << 6);
   assert(r == 0);
 
   for (int i = 0; i < nthreads; i++) {
-    params[i].hdr = hdr;
+    params[i].state = hdr;
+    params[i].ops = &rjn_allocator_ops;
     params[i].nrounds = nrounds;
     params[i].successful_allocations = 0;
     params[i].failed_allocations = 0;

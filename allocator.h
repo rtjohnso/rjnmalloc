@@ -1,13 +1,13 @@
 #include <stddef.h>
 
-typedef void * (*alloc_func)(size_t, size_t);
-typedef void (*free_func)(void *);
-typedef void *(*realloc_func)(void *, size_t, size_t);
+typedef void * (*alloc_func)(void *, size_t, size_t);
+typedef void (*free_func)(void *, void *);
+typedef void *(*realloc_func)(void *, void *, size_t, size_t);
 
 typedef struct {
     alloc_func alloc;
     free_func free;
     realloc_func realloc;
-} allocator;
+} allocator_ops;
 
-extern allocator default_allocator;
+extern allocator_ops default_allocator_ops;
