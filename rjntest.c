@@ -10,6 +10,12 @@
 #include <string.h>
 #include <unistd.h>
 
+// The space used by the rjn allocator
+char rjnbuf[1 << 30];
+
+// A wrapper of malloc for benchmarking comparison.  We limit the amount of
+// space it will allocate at one time to make it more comparable to the rjn
+// allocator.
 typedef struct bounded_default_allocator {
   size_t max_size;
   size_t allocated;
@@ -20,8 +26,11 @@ void *bounded_default_alloc(void *state, size_t alignment, size_t size) {
   if (a->allocated + size > a->max_size) {
     return NULL;
   }
-  a->allocated += size;
-  return aligned_alloc(alignment, size);
+  void *p = aligned_alloc(alignment, size);
+  if (p) {
+    a->allocated += malloc_usable_size(p);
+  }
+  return p;
 }
 
 void bounded_default_free(void *state, void *ptr) {
@@ -33,19 +42,23 @@ void bounded_default_free(void *state, void *ptr) {
 void *bounded_default_realloc(void *state, void *ptr, size_t alignment,
                               size_t size) {
   bounded_default_allocator *a = (bounded_default_allocator *)state;
-  if (a->allocated + size - malloc_usable_size(ptr) > a->max_size) {
+  size_t old_size = malloc_usable_size(ptr);
+  if (a->allocated + size + old_size > a->max_size) {
     return NULL;
   }
-  a->allocated += size;
+  assert(a->allocated >= old_size);
+  a->allocated += size - old_size;
   return realloc(ptr, size);
 }
 
 allocator_ops bounded_default_allocator_ops = {
     bounded_default_alloc, bounded_default_free, bounded_default_realloc};
 
-char rjnbuf[1 << 30];
-
 bounded_default_allocator bd_allocator = {sizeof(rjnbuf), 0};
+
+//
+// The test code itself
+//
 
 typedef struct allocation {
   uint8_t *p;
@@ -150,6 +163,8 @@ void cleanup_test(test_params *params) {
     }
   }
 }
+
+// User interface and main driver
 
 __attribute__((noreturn)) void usage(char *argv0) {
   printf("Usage: %s [-a allocator] [-c] [-n nrounds] [-t nthreads] [-l "
