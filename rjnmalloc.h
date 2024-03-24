@@ -1,3 +1,4 @@
+#include "allocator.h"
 #include <stddef.h>
 
 typedef struct rjn_allocator rjn_allocator;
