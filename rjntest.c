@@ -67,8 +67,6 @@ typedef struct allocation {
   int c;
 } allocation;
 
-#define NALLOCATIONS (1000)
-
 typedef enum alignment_mode { NONE, ARBITRARY } alignment_mode;
 
 typedef struct test_params {
@@ -76,40 +74,91 @@ typedef struct test_params {
   allocator_ops *ops;
   uint64_t nrounds;
   alignment_mode al;
+  int check_contents;
+  int64_t alloc_weight;
+  int64_t realloc_weight;
+  int64_t free_weight;
+  uint64_t min_alloc_size;
+  uint64_t max_alloc_size;
+  uint64_t max_allocations;
+  uint64_t num_allocations;
+  allocation *allocations;
   uint64_t successful_allocations;
   uint64_t failed_allocations;
   uint64_t successful_reallocations;
   uint64_t failed_reallocations;
-  int check_contents;
-  allocation allocations[NALLOCATIONS];
 } test_params;
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+void check_contents(test_params *params, int i) {
+  if (params->check_contents && params->allocations[i].p) {
+    for (unsigned int j = 0; j < params->allocations[i].size; j++) {
+      assert(params->allocations[i].p[j] == params->allocations[i].c);
+    }
+  }
+}
 
 void malloc_test(test_params *params) {
   void *hdr = params->state;
   allocator_ops *ops = params->ops;
   allocation *allocations = params->allocations;
-  memset(params->allocations, 0, sizeof(params->allocations));
+  int total_weight =
+      params->alloc_weight + params->realloc_weight + params->free_weight;
+  assert(0 < total_weight);
 
-  double lsize = log(sizeof(rjnbuf));
+  double lsize;
+  if (params->max_alloc_size == params->min_alloc_size) {
+    lsize = 0;
+  } else {
+    lsize = log(params->max_alloc_size - params->min_alloc_size + 1);
+  }
 
   for (uint64_t j = 0; j < params->nrounds; j++) {
-    int i = rand() % NALLOCATIONS;
-    if (allocations[i].p && params->check_contents) {
-      for (unsigned int k = 0; k < allocations[i].size; k++) {
-        assert(allocations[i].p[k] == allocations[i].c);
+    // Choose our operation and some common parameters
+    int op;
+    if (params->num_allocations == 0) {
+      if (params->alloc_weight + params->realloc_weight == 0) {
+        op = -1; // Always alloc
+      } else {
+        op = rand() % (params->alloc_weight + params->realloc_weight);
       }
+    } else if (params->num_allocations == params->max_allocations) {
+      if (params->realloc_weight + params->free_weight == 0) {
+        op = total_weight; // Always free
+      } else {
+        op = (rand() % (params->realloc_weight + params->free_weight)) +
+             params->alloc_weight;
+      }
+    } else {
+      op = rand() % total_weight;
     }
-
-    uint64_t newsize = exp(lsize * drand48());
+    uint64_t newsize = params->min_alloc_size + exp(lsize * drand48() - 1);
     uint64_t newalignment =
-        params->al == ARBITRARY ? exp(lsize * drand48()) : sizeof(void *);
+        params->al == ARBITRARY ? exp(lsize * drand48() - 1) : sizeof(void *);
 
-    if (rand() % 2) {
+    // Pick an allocation to operate on and do the operation
+    uint64_t i;
+    if (op < params->alloc_weight) {
+      // Alloc
+      i = params->num_allocations;
+      allocations[i].p = ops->alloc(hdr, newalignment, newsize);
+      if (allocations[i].p) {
+        allocations[i].size = newsize;
+        allocations[i].alignment = newalignment;
+        params->successful_allocations++;
+        params->num_allocations++;
+      } else {
+        params->failed_allocations++;
+      }
+
+    } else if (op < params->alloc_weight + params->realloc_weight) {
+      // Realloc
+      i = rand() % (params->num_allocations + 1);
+      check_contents(params, i);
       uint8_t *newp =
           ops->realloc(hdr, allocations[i].p, newalignment, newsize);
-      if (newp || allocations[i].size == 0) {
+      if (newp || newsize == 0) {
         allocations[i].p = newp;
         allocations[i].size = newsize;
         allocations[i].alignment = newalignment;
@@ -117,21 +166,33 @@ void malloc_test(test_params *params) {
       } else {
         params->failed_reallocations++;
       }
-    } else if (allocations[i].p) {
+
+      if (i == params->num_allocations && allocations[i].p) {
+        params->num_allocations++;
+      } else if (i < params->num_allocations && allocations[i].p == NULL) {
+        allocation tmp = allocations[i];
+        allocations[i] = allocations[params->num_allocations - 1];
+        allocations[params->num_allocations - 1] = tmp;
+        params->num_allocations--;
+        i = params->num_allocations;
+      }
+
+    } else {
+      // Free
+      i = rand() % params->num_allocations;
+      check_contents(params, i);
       ops->free(hdr, allocations[i].p);
       allocations[i].p = NULL;
-    } else {
-      allocations[i].p = ops->alloc(hdr, newalignment, newsize);
-      if (allocations[i].p) {
-        allocations[i].size = newsize;
-        allocations[i].alignment = newalignment;
-        params->successful_allocations++;
-      } else {
-        params->failed_allocations++;
-      }
+      allocation tmp = allocations[i];
+      allocations[i] = allocations[params->num_allocations - 1];
+      allocations[params->num_allocations - 1] = tmp;
+      params->num_allocations--;
+      i = params->num_allocations;
     }
-    allocations[i].c = rand() % 256;
-    if (allocations[i].p) {
+
+    // Fill the allocation with a known value
+    if (i < params->num_allocations) {
+      allocations[i].c = rand() % 256;
       if (allocations[i].alignment) {
         assert(((uintptr_t)allocations[i].p) % allocations[i].alignment == 0);
       }
@@ -151,45 +212,57 @@ void cleanup_test(test_params *params) {
   void *hdr = params->state;
   allocator_ops *ops = params->ops;
   allocation *allocations = params->allocations;
-  for (int i = 0; i < NALLOCATIONS; i++) {
-    if (allocations[i].p) {
-      if (params->check_contents) {
-        for (unsigned int j = 0; j < allocations[i].size; j++) {
-          assert(allocations[i].p[j] == allocations[i].c);
-        }
+  for (uint64_t i = 0; i < params->num_allocations; i++) {
+    if (params->check_contents) {
+      for (unsigned int j = 0; j < allocations[i].size; j++) {
+        assert(allocations[i].p[j] == allocations[i].c);
       }
-      ops->free(hdr, allocations[i].p);
-      allocations[i].p = NULL;
     }
+    ops->free(hdr, allocations[i].p);
+    allocations[i].p = NULL;
   }
 }
 
 // User interface and main driver
 
 __attribute__((noreturn)) void usage(char *argv0) {
-  printf("Usage: %s [-a allocator] [-c] [-n nrounds] [-t nthreads] [-l "
-         "alignment-mode] [-s seed]\n",
+  printf("Usage: %s [-a allocator] [-c] [-n nallocs] [-r rounds] [-t nthreads] "
+         "[-l "
+         "alignment-mode] [-m min-allocation-size] [-M max-allocation-size] "
+         "[-A alloc-weight] [-R realloc-weight] [-F free-weight] [-s seed]\n",
          argv0);
   printf("  -a: allocator (\"malloc\", \"rjn\")\n");
   printf("  -c: check contents of allocations\n");
-  printf("  -n: number of rounds\n");
+  printf("  -n: number of allocations\n");
+  printf("  -r: number of rounds\n");
   printf("  -t: number of threads\n");
   printf("  -l: alignment mode (\"none\", \"arbitrary\")\n");
+  printf("  -m: minimum allocation size\n");
+  printf("  -M: maximum allocation size\n");
+  printf("  -A: weight of allocations\n");
+  printf("  -R: weight of reallocations\n");
+  printf("  -F: weight of frees\n");
   printf("  -s: seed\n");
   exit(EXIT_FAILURE);
 }
 
 int main(int argc, char **argv) {
+  int nallocs = 1000;
   int nrounds = 1000000;
   int nthreads = 4;
   int check_contents = 0;
   uint64_t seed = 0;
   char *allocator = "rjn";
   alignment_mode alignment = NONE;
+  uint64_t min_alloc_size = 0;
+  uint64_t max_alloc_size = 0;
+  uint64_t alloc_weight = 1;
+  uint64_t realloc_weight = 1;
+  uint64_t free_weight = 1;
 
   int opt;
   char *endptr;
-  while ((opt = getopt(argc, argv, ":a:cn:t:l:s:")) != -1) {
+  while ((opt = getopt(argc, argv, ":a:cn:r:t:l:m:M:A:R:F:s:")) != -1) {
     switch (opt) {
     case 'a':
       allocator = optarg;
@@ -198,6 +271,13 @@ int main(int argc, char **argv) {
       check_contents = 1;
       break;
     case 'n':
+      nallocs = strtoull(optarg, &endptr, 0);
+      if (*endptr != '\0') {
+        printf("Invalid number of allocations: %s\n", optarg);
+        usage(argv[0]);
+      }
+      break;
+    case 'r':
       nrounds = strtoull(optarg, &endptr, 0);
       if (*endptr != '\0') {
         printf("Invalid number of rounds: %s\n", optarg);
@@ -221,6 +301,20 @@ int main(int argc, char **argv) {
         usage(argv[0]);
       }
       break;
+    case 'm':
+      min_alloc_size = strtoull(optarg, &endptr, 0);
+      if (*endptr != '\0') {
+        printf("Invalid min allocation size: %s\n", optarg);
+        usage(argv[0]);
+      }
+      break;
+    case 'M':
+      max_alloc_size = strtoull(optarg, &endptr, 0);
+      if (*endptr != '\0') {
+        printf("Invalid max allocation size: %s\n", optarg);
+        usage(argv[0]);
+      }
+      break;
     case 's':
       seed = strtoull(optarg, &endptr, 0);
       if (*endptr != '\0') {
@@ -229,6 +323,27 @@ int main(int argc, char **argv) {
       }
       srand(seed);
       srand48(rand());
+      break;
+    case 'A':
+      alloc_weight = strtoull(optarg, &endptr, 0);
+      if (*endptr != '\0') {
+        printf("Invalid allocation weight: %s\n", optarg);
+        usage(argv[0]);
+      }
+      break;
+    case 'R':
+      realloc_weight = strtoull(optarg, &endptr, 0);
+      if (*endptr != '\0') {
+        printf("Invalid reallocation weight: %s\n", optarg);
+        usage(argv[0]);
+      }
+      break;
+    case 'F':
+      free_weight = strtoull(optarg, &endptr, 0);
+      if (*endptr != '\0') {
+        printf("Invalid free weight: %s\n", optarg);
+        usage(argv[0]);
+      }
       break;
     case ':':
       printf("Option -%c requires an operand\n", optopt);
@@ -255,6 +370,23 @@ int main(int argc, char **argv) {
     usage(argv[0]);
   }
 
+  if (max_alloc_size == 0) {
+    max_alloc_size = sizeof(rjnbuf);
+  }
+
+  if (max_alloc_size < min_alloc_size) {
+    printf(
+        "Max allocation size must be greater than or equal to min allocation "
+        "size\n");
+    usage(argv[0]);
+  }
+
+  if (alloc_weight + realloc_weight + free_weight == 0) {
+    printf("At least one of alloc_weight, realloc_weight, or free_weight must "
+           "be non-zero\n");
+    usage(argv[0]);
+  }
+
   test_params *params = (test_params *)malloc(sizeof(test_params) * nthreads);
 
   for (int i = 0; i < nthreads; i++) {
@@ -262,11 +394,20 @@ int main(int argc, char **argv) {
     params[i].ops = ops;
     params[i].nrounds = nrounds;
     params[i].al = alignment;
+    params[i].check_contents = check_contents;
+    params[i].min_alloc_size = min_alloc_size;
+    params[i].max_alloc_size = max_alloc_size;
+    params[i].alloc_weight = alloc_weight;
+    params[i].realloc_weight = realloc_weight;
+    params[i].free_weight = free_weight;
+    params[i].max_allocations = nallocs;
+    params[i].num_allocations = 0;
+    params[i].allocations = (allocation *)calloc(nallocs, sizeof(allocation));
+
     params[i].successful_allocations = 0;
     params[i].failed_allocations = 0;
     params[i].successful_reallocations = 0;
     params[i].failed_reallocations = 0;
-    params[i].check_contents = check_contents;
   }
 
   printf("Running malloc_test with %d thread%s for %d round%s\n", nthreads,

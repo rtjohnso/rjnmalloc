@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define RJN_DEBUG 0
-#define RJN_DUMP_CHUNKS 0
+#define RJN_DUMP_CHUNKS 1
 #define debug_code __attribute__((unused))
 #if RJN_DEBUG
 #define debug_printf(...) printf(__VA_ARGS__)
