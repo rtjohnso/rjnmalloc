@@ -226,11 +226,13 @@ void cleanup_test(test_params *params) {
 // User interface and main driver
 
 __attribute__((noreturn)) void usage(char *argv0) {
-  printf("Usage: %s [-a allocator] [-c] [-n nallocs] [-r rounds] [-t nthreads] "
-         "[-l "
-         "alignment-mode] [-m min-allocation-size] [-M max-allocation-size] "
-         "[-A alloc-weight] [-R realloc-weight] [-F free-weight] [-s seed]\n",
-         argv0);
+  int argv0len = strlen(argv0);
+  printf(
+      "Usage: %1$s [-a allocator] [-c] [-n nallocs] [-r rounds] [-t nthreads]\n"
+      "       %2$*3$s [-l alignment-mode] [-m min-allocation-size]\n"
+      "       %2$*3$s [-M max-allocation-size] [-A alloc-weight]\n"
+      "       %2$*3$s [-R realloc-weight] [-F free-weight] [-s seed]\n",
+      argv0, "", argv0len);
   printf("  -a: allocator (\"malloc\", \"rjn\")\n");
   printf("  -c: check contents of allocations\n");
   printf("  -n: number of allocations\n");
