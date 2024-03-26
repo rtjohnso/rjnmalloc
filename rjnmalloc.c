@@ -30,9 +30,6 @@ struct rjn {
   // should make it easier to grow regions in the future.
   uint64_t metadata_offset;
   uint64_t size_classes_offset;
-
-  uint64_t cached_chunk;
-  uint64_t cached_chunk_size;
 };
 
 typedef struct rjn_node {
