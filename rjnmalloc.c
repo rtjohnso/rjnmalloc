@@ -30,6 +30,9 @@ struct rjn {
   // should make it easier to grow regions in the future.
   uint64_t metadata_offset;
   uint64_t size_classes_offset;
+
+  uint64_t cached_chunk;
+  uint64_t cached_chunk_size;
 };
 
 typedef struct rjn_node {
@@ -133,13 +136,8 @@ static void rjn_metadata_set(const rjn *rj, uint64_t unit, uint8_t value) {
                                             : "size?",
                metaname[value]);
 
-  uint8_t oldbyte;
-  uint8_t newbyte;
-  do {
-    oldbyte = VECTOR_BYTE(metadata, unit);
-    newbyte = oldbyte ^ BYTE_INSERT(value ^ BYTE_EXTRACT(oldbyte, unit), unit);
-  } while (!__sync_bool_compare_and_swap(&VECTOR_BYTE(metadata, unit), oldbyte,
-                                         newbyte));
+  uint8_t mask = BYTE_INSERT(META_GET(metadata, unit) ^ value, unit);
+  __sync_fetch_and_xor(&VECTOR_BYTE(metadata, unit), mask);
 }
 
 /* This performs the following logical operation atomically:
@@ -283,10 +281,12 @@ static void rjn_metadata_set_size(const rjn *rj, uint64_t first_unit,
                                   uint64_t units) {
   assert(first_unit + units <= rj->num_allocation_units);
   uint8_t *metadata = rjn_metadata_vector(rj);
-  assert(META_GET(metadata, first_unit) == RJN_META_UNARY ||
-         META_GET(metadata, first_unit) == RJN_META_BINARY);
+  uint8_t fum = META_GET(metadata, first_unit);
+  assert(fum == RJN_META_UNARY || fum == RJN_META_BINARY);
   if (units < RJN_MIN_BINARY_UNITS) {
-    rjn_metadata_set(rj, first_unit, RJN_META_UNARY);
+    if (fum != RJN_META_UNARY) {
+      rjn_metadata_set(rj, first_unit, RJN_META_UNARY);
+    }
     assert(first_unit + units <= rj->num_allocation_units);
     uint64_t i;
     for (i = 1; i < units - 1 && (first_unit + i) % META_ENTRIES_PER_BYTE;
@@ -303,7 +303,9 @@ static void rjn_metadata_set_size(const rjn *rj, uint64_t first_unit,
         (first_unit + META_ENTRIES_PER_BYTE) / META_ENTRIES_PER_BYTE;
     assert(size_start + sizeof(uint64_t) <=
            (first_unit + units) / META_ENTRIES_PER_BYTE);
-    rjn_metadata_set(rj, first_unit, RJN_META_BINARY);
+    if (fum != RJN_META_BINARY) {
+      rjn_metadata_set(rj, first_unit, RJN_META_BINARY);
+    }
     memcpy(&metadata[size_start], &units, sizeof(uint64_t));
   }
 }
