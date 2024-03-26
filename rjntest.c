@@ -142,6 +142,7 @@ void malloc_test(test_params *params) {
     if (op < params->alloc_weight) {
       // Alloc
       i = params->num_allocations;
+      assert(i < params->max_allocations);
       allocations[i].p = ops->alloc(hdr, newalignment, newsize);
       if (allocations[i].p) {
         allocations[i].size = newsize;
@@ -154,7 +155,8 @@ void malloc_test(test_params *params) {
 
     } else if (op < params->alloc_weight + params->realloc_weight) {
       // Realloc
-      i = rand() % (params->num_allocations + 1);
+      i = (rand() % (params->num_allocations + 1)) % params->max_allocations;
+      assert(i < params->max_allocations);
       check_contents(params, i);
       uint8_t *newp =
           ops->realloc(hdr, allocations[i].p, newalignment, newsize);
@@ -180,6 +182,7 @@ void malloc_test(test_params *params) {
     } else {
       // Free
       i = rand() % params->num_allocations;
+      assert(i < params->max_allocations);
       check_contents(params, i);
       ops->free(hdr, allocations[i].p);
       allocations[i].p = NULL;
