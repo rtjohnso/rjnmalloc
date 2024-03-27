@@ -1,6 +1,7 @@
 #include "rjnmalloc.h"
 #define _XOPEN_SOURCE
 #include <assert.h>
+#include <immintrin.h>
 #include <inttypes.h>
 #include <malloc.h>
 #include <math.h>
@@ -28,14 +29,15 @@ void *bounded_default_alloc(void *state, size_t alignment, size_t size) {
   }
   void *p = aligned_alloc(alignment, size);
   if (p) {
-    a->allocated += malloc_usable_size(p);
+    __sync_fetch_and_add(&a->allocated, malloc_usable_size(p));
   }
   return p;
 }
 
 void bounded_default_free(void *state, void *ptr) {
   bounded_default_allocator *a = (bounded_default_allocator *)state;
-  a->allocated -= malloc_usable_size(ptr);
+  assert(a->allocated >= malloc_usable_size(ptr));
+  __sync_fetch_and_sub(&a->allocated, malloc_usable_size(ptr));
   free(ptr);
 }
 
@@ -43,12 +45,13 @@ void *bounded_default_realloc(void *state, void *ptr, size_t alignment,
                               size_t size) {
   bounded_default_allocator *a = (bounded_default_allocator *)state;
   size_t old_size = malloc_usable_size(ptr);
-  if (a->allocated + size + old_size > a->max_size) {
+  assert(a->allocated >= old_size);
+  if (a->allocated + size - old_size > a->max_size) {
     return NULL;
   }
-  assert(a->allocated >= old_size);
-  a->allocated += size - old_size;
-  return realloc(ptr, size);
+  void *p = realloc(ptr, size);
+  __sync_fetch_and_add(&a->allocated, malloc_usable_size(p) - old_size);
+  return p;
 }
 
 allocator_ops bounded_default_allocator_ops = {

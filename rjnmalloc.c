@@ -14,7 +14,11 @@
 #define debug_printf(...)
 #endif
 
+#define USE_GLOBAL_LOCK
+//#define PROFILE_CACHE_LINE_CAS
+
 struct rjn {
+  int global_lock;
   size_t region_size;
   size_t allocation_unit_size;
   uint64_t num_allocation_units;
@@ -30,6 +34,9 @@ struct rjn {
   // should make it easier to grow regions in the future.
   uint64_t metadata_offset;
   uint64_t size_classes_offset;
+
+  uint64_t cached_chunk;
+  uint64_t cached_chunk_units;
 };
 
 typedef struct rjn_node {
@@ -61,6 +68,22 @@ static const char *metaname[] = {"C", "U", "B", "F"};
 /*
  * Elementary operations
  */
+void rjn_lock(rjn *rj) {
+#ifdef USE_GLOBAL_LOCK
+  while (__sync_lock_test_and_set(&rj->global_lock, 1)) {
+    while (rj->global_lock) {
+      _mm_pause();
+    }
+  }
+#endif
+}
+
+void rjn_unlock(rjn *rj) {
+#ifdef USE_GLOBAL_LOCK
+  rj->global_lock = 0;
+#endif
+}
+
 uint64_t rjn_offset(const rjn *rj, const void *ptr) {
   assert((uint8_t *)ptr >= (uint8_t *)rj);
   assert((uint8_t *)ptr < (uint8_t *)rj + rj->region_size);
@@ -109,6 +132,60 @@ static uint8_t rjn_metadata_get(const rjn *rj, uint64_t unit) {
   return META_GET(metadata, unit);
 }
 
+#ifdef PROFILE_CACHE_LINE_CAS
+static uint64_t within_cl_cas_time = 0;
+static uint64_t within_cl_cas_count = 0;
+static uint64_t cross_cl_cas_time = 0;
+static uint64_t cross_cl_cas_count = 0;
+#endif
+
+#ifdef USE_GLOBAL_LOCK
+// We don't need to use atomic instructions for fine-grained concurrency
+#define CAS(p, o, n)                                                           \
+  ({                                                                           \
+    *(p) = n;                                                                  \
+    1;                                                                         \
+  })
+#define ATOMIC_XOR(p, v) *(p) ^= v
+#define TEST_AND_SET(p)                                                        \
+  ({                                                                           \
+    *(p) = 1;                                                                  \
+    0;                                                                         \
+  })
+#else // USE_GLOBAL_LOCK
+#ifdef PROFILE_CACHE_LINE_CAS
+#define CAS(p, o, n)                                                           \
+  ({                                                                           \
+    uint64_t start = __rdtsc();                                                \
+    int result = __sync_bool_compare_and_swap(p, o, n);                        \
+    uint64_t end = __rdtsc();                                                  \
+    if (sizeof(*p) == 1 || ((uint64_t)p % 64) < 63) {                          \
+      within_cl_cas_count++;                                                   \
+      within_cl_cas_time += end - start;                                       \
+    } else {                                                                   \
+      cross_cl_cas_count++;                                                    \
+      cross_cl_cas_time += end - start;                                        \
+    }                                                                          \
+    result;                                                                    \
+  })
+#else // PROFILE_CACHE_LINE_CAS
+#define CAS(p, o, n) __sync_bool_compare_and_swap(p, o, n)
+#endif // PROFILE_CACHE_LINE_CAS
+#define ATOMIC_XOR(p, v) __sync_fetch_and_xor(p, v)
+#define TEST_AND_SET(p) __sync_lock_test_and_set(p, 1)
+#endif // USE_GLOBAL_LOCK
+
+// Check whether the CAS operation on the metadata for unit and unit+1 (which is
+// done as part of free) is likely to be slow because it crosses a cache line
+// boundary.  We avoid breaking chunks at the end of a metadatata cache line,
+// because cross-cache-line CASes are incredibly slow.
+static int is_bad_place_to_end(const rjn *rj, uint64_t unit) {
+  uint8_t *metadata = rjn_metadata_vector(rj);
+  uint8_t *p = &metadata[VECTOR_INDEX(unit)];
+  int off = unit % META_ENTRIES_PER_BYTE;
+  return off == META_ENTRIES_PER_BYTE - 1 && ((uint64_t)p % 64) == 63;
+}
+
 static int rjn_metadata_cas(const rjn *rj, uint64_t unit, uint8_t old,
                             uint8_t new) {
   assert(unit < rj->num_allocation_units);
@@ -120,8 +197,7 @@ static int rjn_metadata_cas(const rjn *rj, uint64_t unit, uint8_t old,
     if (BYTE_EXTRACT(oldbyte, unit) != old) {
       return 0;
     }
-  } while (!__sync_bool_compare_and_swap(&VECTOR_BYTE(metadata, unit), oldbyte,
-                                         oldbyte ^ mask));
+  } while (!CAS(&VECTOR_BYTE(metadata, unit), oldbyte, oldbyte ^ mask));
   return 1;
 }
 
@@ -134,7 +210,7 @@ static void rjn_metadata_set(const rjn *rj, uint64_t unit, uint8_t value) {
                metaname[value]);
 
   uint8_t mask = BYTE_INSERT(META_GET(metadata, unit) ^ value, unit);
-  __sync_fetch_and_xor(&VECTOR_BYTE(metadata, unit), mask);
+  ATOMIC_XOR(&VECTOR_BYTE(metadata, unit), mask);
 }
 
 /* This performs the following logical operation atomically:
@@ -170,12 +246,10 @@ static int rjn_metadata_try_set_end_to_free(const rjn *rj, uint64_t unit) {
   if (VECTOR_INDEX(unit + 1) == VECTOR_INDEX(unit)) {
     // Do a 1-byte CAS, which reduces the probability of performing a
     // cross-cache-line CAS, which are hella slow.
-    return __sync_bool_compare_and_swap(&metadata[moff], oldmeta[0],
-                                        newmeta[0]);
+    return CAS(&metadata[moff], oldmeta[0], newmeta[0]);
   } else {
     uint16_t *p = (uint16_t *)&metadata[moff];
-    return __sync_bool_compare_and_swap(p, *(uint16_t *)oldmeta,
-                                        *(uint16_t *)newmeta);
+    return CAS(p, *(uint16_t *)oldmeta, *(uint16_t *)newmeta);
   }
 }
 
@@ -211,12 +285,10 @@ static int rjn_metadata_try_set_start_to_free(const rjn *rj, uint64_t unit) {
   if (VECTOR_INDEX(unit) == moff) {
     // Do a 1-byte CAS, which reduces the probability of performing a
     // cross-cache-line CAS, which are hella slow.
-    return __sync_bool_compare_and_swap(&metadata[moff], oldmeta[0],
-                                        newmeta[0]);
+    return CAS(&metadata[moff], oldmeta[0], newmeta[0]);
   } else {
     uint16_t *p = (uint16_t *)&metadata[moff];
-    return __sync_bool_compare_and_swap(p, *(uint16_t *)oldmeta,
-                                        *(uint16_t *)newmeta);
+    return CAS(p, *(uint16_t *)oldmeta, *(uint16_t *)newmeta);
   }
 }
 
@@ -265,12 +337,10 @@ static int rjn_metadata_try_set_singleton_to_free(const rjn *rj,
   if (VECTOR_INDEX(unit + 1) == VECTOR_INDEX(unit - 1)) {
     // Do a 1-byte CAS, which reduces the probability of performing a
     // cross-cache-line CAS, which are hella slow.
-    return __sync_bool_compare_and_swap(&metadata[moff], oldmeta[0],
-                                        newmeta[0]);
+    return CAS(&metadata[moff], oldmeta[0], newmeta[0]);
   } else {
     uint16_t *p = (uint16_t *)&metadata[moff];
-    return __sync_bool_compare_and_swap(p, *(uint16_t *)oldmeta,
-                                        *(uint16_t *)newmeta);
+    return CAS(p, *(uint16_t *)oldmeta, *(uint16_t *)newmeta);
   }
 }
 
@@ -461,7 +531,7 @@ static size_class *rjn_find_size_class(const rjn *rj, size_t units) {
 }
 
 static void rjn_lock_size_class(size_class *sc) {
-  while (__sync_lock_test_and_set(&sc->head.size, 1)) {
+  while (TEST_AND_SET(&sc->head.size)) {
     while (sc->head.size) {
       _mm_pause();
     }
@@ -817,6 +887,7 @@ restart:
 }
 
 void rjn_free(rjn *rj, void *ptr) {
+  rjn_lock(rj);
   rjn_validate(rj);
   uint64_t first_unit = (rjn_offset(rj, ptr) - rj->allocation_units_offset) /
                         rj->allocation_unit_size;
@@ -831,6 +902,7 @@ void rjn_free(rjn *rj, void *ptr) {
   node->prev = node->next = 0;
   rjn_free_chunk(rj, first_unit, size);
   rjn_validate(rj);
+  rjn_unlock(rj);
 }
 
 /*
@@ -920,16 +992,24 @@ restart:
 
     // Give back any remaining space at the end
     if (required_units < node_size) {
-      if (1 < allocated_units) {
-        rjn_metadata_set(rj, first_unit + pad_units + allocated_units - 1,
-                         RJN_META_CONTINUATION);
+      if (is_bad_place_to_end(rj,
+                              first_unit + pad_units + allocated_units - 1)) {
+        allocated_units++;
+        required_units++;
       }
-      rjn_metadata_set(rj, first_unit + pad_units + allocated_units,
-                       RJN_META_UNARY);
-      memset(rjn_allocation_unit(rj, first_unit + pad_units + allocated_units),
-             0, sizeof(rjn_node));
-      rjn_free_chunk(rj, first_unit + pad_units + allocated_units,
-                     node_size - pad_units - allocated_units);
+      if (required_units < node_size) {
+        if (1 < allocated_units) {
+          rjn_metadata_set(rj, first_unit + pad_units + allocated_units - 1,
+                           RJN_META_CONTINUATION);
+        }
+        rjn_metadata_set(rj, first_unit + pad_units + allocated_units,
+                         RJN_META_UNARY);
+        memset(
+            rjn_allocation_unit(rj, first_unit + pad_units + allocated_units),
+            0, sizeof(rjn_node));
+        rjn_free_chunk(rj, first_unit + pad_units + allocated_units,
+                       node_size - pad_units - allocated_units);
+      }
     }
 
     rjn_metadata_set_size(rj, first_unit + pad_units, allocated_units);
@@ -944,12 +1024,69 @@ restart:
   return NULL;
 }
 
+#define RJN_CACHE_UNITS (1024)
+
+static void *rjn_try_alloc_from_cache(rjn *rj, size_t alignment, size_t size) {
+  return NULL;
+  uint64_t required_units =
+      (size + rj->allocation_unit_size - 1) / rj->allocation_unit_size;
+
+  if (rj->allocation_unit_size % alignment) {
+    return NULL;
+  }
+
+  if (RJN_CACHE_UNITS <= required_units) {
+    return NULL;
+  }
+
+  if (rj->cached_chunk_units < required_units) {
+    if (rj->cached_chunk_units > RJN_CACHE_UNITS / 10) {
+      return NULL;
+    }
+    if (rj->cached_chunk_units) {
+      rjn_free_chunk(rj, rj->cached_chunk, rj->cached_chunk_units);
+      rj->cached_chunk = 0;
+      rj->cached_chunk_units = 0;
+    }
+    void *ptr = rjn_alloc(rj, 1, rj->allocation_unit_size * RJN_CACHE_UNITS);
+    if (!ptr) {
+      return NULL;
+    }
+    rj->cached_chunk = (rjn_offset(rj, ptr) - rj->allocation_units_offset) /
+                       rj->allocation_unit_size;
+    rj->cached_chunk_units = RJN_CACHE_UNITS;
+  }
+
+  if (1 < required_units) {
+    rjn_metadata_set(rj, rj->cached_chunk + required_units - 1,
+                     RJN_META_CONTINUATION);
+  }
+  rjn_metadata_set(rj, rj->cached_chunk + required_units, RJN_META_UNARY);
+  rjn_metadata_set_size(rj, rj->cached_chunk, required_units);
+
+  void *ptr = rjn_allocation_unit(rj, rj->cached_chunk);
+  rj->cached_chunk_units -= required_units;
+  rj->cached_chunk += required_units;
+  return ptr;
+}
+
 void *rjn_alloc(rjn *rj, size_t alignment, size_t size) {
+  rjn_lock(rj);
   debug_printf("alloc %lu %lu\n", alignment, size);
   // Emulate the behavior of malloc(0), which returns a different, valid
   // pointer every time it is called.
   if (size == 0) {
     size = 1;
+  }
+
+  if (alignment == 0) {
+    alignment = 1;
+  }
+
+  void *ptr = rjn_try_alloc_from_cache(rj, alignment, size);
+  if (ptr) {
+    rjn_unlock(rj);
+    return ptr;
   }
 
   size_t min_units =
@@ -961,20 +1098,22 @@ void *rjn_alloc(rjn *rj, size_t alignment, size_t size) {
   // to alignment constraints).
   for (unsigned int scidx = 1 + rjn_find_size_class_index(rj, min_units);
        scidx < num_sclasses; scidx++) {
-    void *ptr = rjn_alloc_from_size_class(rj, scidx, alignment, size);
+    ptr = rjn_alloc_from_size_class(rj, scidx, alignment, size);
     if (ptr) {
+      rjn_unlock(rj);
       return ptr;
     }
   }
   // OK we're desperate.  Try groveling through the size class for this
   // particular size to see if there's anything there.
-  return rjn_alloc_from_size_class(rj, rjn_find_size_class_index(rj, min_units),
-                                   alignment, size);
+  ptr = rjn_alloc_from_size_class(rj, rjn_find_size_class_index(rj, min_units),
+                                  alignment, size);
+  rjn_unlock(rj);
+  return ptr;
 }
 
 void *rjn_realloc(rjn *rj, void *ptr, size_t alignment, size_t new_bytes) {
   debug_printf("realloc %p %lu %lu\n", ptr, alignment, new_bytes);
-  rjn_validate(rj);
 
   if (ptr == NULL) {
     return rjn_alloc(rj, alignment, new_bytes);
@@ -983,6 +1122,7 @@ void *rjn_realloc(rjn *rj, void *ptr, size_t alignment, size_t new_bytes) {
     rjn_free(rj, ptr);
     return NULL;
   }
+
   uint64_t first_unit = (rjn_offset(rj, ptr) - rj->allocation_units_offset) /
                         rj->allocation_unit_size;
   uint64_t old_units = rjn_metadata_get_size(rj, first_unit);
@@ -1005,9 +1145,16 @@ void *rjn_realloc(rjn *rj, void *ptr, size_t alignment, size_t new_bytes) {
                              new_bytes + rj->allocation_unit_size - 1) /
                             rj->allocation_unit_size;
 
+  if (is_bad_place_to_end(rj, first_unit + required_units - 1)) {
+    required_units++;
+  }
+
   if (required_units == old_units) {
     return ptr;
   }
+
+  rjn_lock(rj);
+  rjn_validate(rj);
 
   if (new_bytes <= old_bytes) {
     rjn_metadata_erase_size(rj, first_unit, old_units);
@@ -1020,6 +1167,7 @@ void *rjn_realloc(rjn *rj, void *ptr, size_t alignment, size_t new_bytes) {
            sizeof(rjn_node));
     rjn_free_chunk(rj, first_unit + required_units, old_units - required_units);
     rjn_metadata_set_size(rj, first_unit, required_units);
+    rjn_unlock(rj);
     return ptr;
   } else {
     uint64_t succ_start = rjn_grab_successor_if_free(rj, first_unit, old_units);
@@ -1044,6 +1192,7 @@ void *rjn_realloc(rjn *rj, void *ptr, size_t alignment, size_t new_bytes) {
                          old_units + succ_start_node->size - required_units);
         }
         rjn_metadata_set_size(rj, first_unit, required_units);
+        rjn_unlock(rj);
         return ptr;
       } else {
         rjn_lock_size_class(sc);
@@ -1053,6 +1202,7 @@ void *rjn_realloc(rjn *rj, void *ptr, size_t alignment, size_t new_bytes) {
       }
     }
 
+    rjn_unlock(rj);
     void *new_ptr = rjn_alloc(rj, alignment, new_bytes);
     if (new_ptr) {
       memcpy(new_ptr, ptr, copy_size);
@@ -1074,6 +1224,7 @@ int rjn_init(rjn *rj, size_t region_size, size_t allocation_unit_size) {
     return -1;
   }
 
+  rj->global_lock = 0;
   rj->region_size = region_size;
   rj->allocation_unit_size = allocation_unit_size;
 
@@ -1169,6 +1320,18 @@ void rjn_print_allocation_stats(const rjn *rj) {
   printf("total free units: %" PRIu64 "\n", total_free_units);
   printf("total free bytes: %" PRIu64 "\n",
          total_free_units * rj->allocation_unit_size);
+
+#ifdef PROFILE_CACHE_LINE_CAS
+  printf("----------------------------------------\n");
+  printf("within_cl_cas_count: %" PRIu64 "\n", within_cl_cas_count);
+  printf("within_cl_cas_time: %" PRIu64 "\n", within_cl_cas_time);
+  printf("within_cl_cas_time / within_cl_cas_count: %" PRIu64 "\n",
+         within_cl_cas_count ? within_cl_cas_time / within_cl_cas_count : 0);
+  printf("cross_cl_cas_count: %" PRIu64 "\n", cross_cl_cas_count);
+  printf("cross_cl_cas_time: %" PRIu64 "\n", cross_cl_cas_time);
+  printf("cross_cl_cas_time / cross_cl_cas_count: %" PRIu64 "\n",
+         cross_cl_cas_count ? cross_cl_cas_time / cross_cl_cas_count : 0);
+#endif
 }
 
 allocator_ops rjn_allocator_ops = {
