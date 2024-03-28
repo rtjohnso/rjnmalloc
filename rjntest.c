@@ -136,7 +136,8 @@ void malloc_test(test_params *params) {
     } else {
       op = rand() % total_weight;
     }
-    uint64_t newsize = params->min_alloc_size + exp(lsize * drand48() - 1);
+    uint64_t newsize =
+        params->min_alloc_size + exp(lsize * drand48() * drand48() - 1);
     uint64_t newalignment =
         params->al == ARBITRARY ? exp(lsize * drand48() - 1) : sizeof(void *);
 
@@ -255,16 +256,16 @@ __attribute__((noreturn)) void usage(char *argv0) {
 }
 
 int main(int argc, char **argv) {
-  int nallocs = 1000;
+  int nallocs = 10000;
   int nrounds = 1000000;
-  int nthreads = 4;
+  int nthreads = 8;
   int check_contents = 0;
   uint64_t seed = 0;
   char *allocator = "rjn";
   alignment_mode alignment = NONE;
   uint64_t min_alloc_size = 0;
   uint64_t max_alloc_size = 0;
-  uint64_t alloc_weight = 1;
+  uint64_t alloc_weight = 2;
   uint64_t realloc_weight = 1;
   uint64_t free_weight = 1;
 
