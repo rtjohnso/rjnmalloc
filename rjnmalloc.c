@@ -15,7 +15,7 @@
 #endif
 
 //#define USE_GLOBAL_LOCK
-#define PROFILE_CACHE_LINE_CAS
+//#define PROFILE_CACHE_LINE_CAS
 
 typedef struct range {
   // Both in units
